@@ -25,6 +25,7 @@
 //                   sdr_rcv_str_stat()
 //                   add API sdr_rcv_write_str()
 //  2026-08-08  1.13 report an output stream open error as stream status error
+//  2026-10-03  1.14 add batched tracking correlator groups (option trk_batch)
 //
 #include "pocket_sdr.h"
 
@@ -53,6 +54,7 @@
 
 // global variables ------------------------------------------------------------
 double sdr_max_acq = MAX_ACQ;
+static int trk_batch = 0;      // batched tracking correlators (0:off,1:on)
 
 // real-to-complex state -------------------------------------------------------
 static inline int rtoc_of(const sdr_rcv_t *rcv, int i)
@@ -511,6 +513,7 @@ static sdr_ch_th_t *ch_th_new(const char *sig, int prn, double fi, double fs,
         return NULL;
     }
     th->rcv = rcv;
+    sdr_mutex_init(&th->mtx);
     return th;
 }
 
@@ -522,7 +525,34 @@ static void ch_th_free(sdr_ch_th_t *th)
     sdr_free(th);
 }
 
+// update navigation and observation data of SDR receiver CH ------------------
+static void ch_th_udpvt(sdr_ch_th_t *th)
+{
+    sdr_ch_t *ch = th->ch;
+    
+    // update navigation data
+    if (ch->nav->stat) {
+        sdr_pvt_udnav(th->rcv->pvt, ch);
+        ch->nav->stat = 0;
+    }
+    // update observation data
+    sdr_pvt_udobs(th->rcv->pvt, th->ix, ch);
+}
+
+// update SDR receiver CH for an epoch -----------------------------------------
+static void ch_th_update(sdr_ch_th_t *th)
+{
+    sdr_ch_t *ch = th->ch;
+    
+    sdr_ch_update(ch, th->ix * SDR_CYC, th->rcv->buff[ch->rf_ch],
+        th->rcv->N * (int)(th->ix % MAX_BUFF));
+    ch_th_udpvt(th);
+    th->ix += ch->N / th->rcv->N;
+}
+
 // SDR receiver CH thread ------------------------------------------------------
+//   (the tracking epochs of the channels in a batched correlator group are
+//   updated by the group thread)
 static void *ch_thread(void *arg)
 {
     sdr_ch_th_t *th = (sdr_ch_th_t *)arg;
@@ -531,23 +561,126 @@ static void *ch_thread(void *arg)
     
     while (th->state) {
         int64_t ix = get_buff_ix(th->rcv);
-        for ( ; th->ix + 2 * n <= ix && th->state; th->ix += n) {
-            
-            // update SDR receiver CH
-            sdr_ch_update(ch, th->ix * SDR_CYC, th->rcv->buff[ch->rf_ch],
-                th->rcv->N * (int)(th->ix % MAX_BUFF));
-            
-            // update navigation data
-            if (ch->nav->stat) {
-                sdr_pvt_udnav(th->rcv->pvt, ch);
-                ch->nav->stat = 0;
+        while (th->ix + 2 * n <= ix && th->state) {
+            sdr_mutex_lock(&th->mtx);
+            if (th->batch && ch->state == SDR_STATE_LOCK) {
+                sdr_mutex_unlock(&th->mtx);
+                break;
             }
-            // update observation data
-            sdr_pvt_udobs(th->rcv->pvt, th->ix, ch);
+            ch_th_update(th);
+            sdr_mutex_unlock(&th->mtx);
         }
         sdr_sleep_msec(TH_CYC);
     }
     return NULL;
+}
+
+// batched correlator group of SDR receiver CHs --------------------------------
+typedef struct {
+    sdr_rcv_t *rcv;             // SDR receiver
+    int rf_ch, n;               // RF channel and code period (cyc)
+    int nth;                    // number of channels
+    sdr_ch_th_t *th[SDR_MAX_NCH]; // channel threads
+    int64_t ix;                 // IF data buffer read pointer (cyc)
+    int state;                  // state (0:stop,1:run)
+    sdr_thread_t thread;        // group thread
+} grp_th_t;
+
+// batched correlator group thread ---------------------------------------------
+//   The channels in tracking state are updated epoch by epoch with the
+//   tracking correlators of the epoch batched by sdr_acc_corr_batch(). The
+//   other states (search, idle) are updated by the channel threads.
+static void *grp_thread(void *arg)
+{
+    static __thread sdr_corr_job_t jobs[SDR_MAX_NCH];
+    grp_th_t *g = (grp_th_t *)arg;
+    sdr_rcv_t *rcv = g->rcv;
+    sdr_ch_th_t *ths[SDR_MAX_NCH];
+    
+    while (g->state) {
+        int64_t ix = get_buff_ix(rcv);
+        for ( ; g->ix + 2 * g->n <= ix && g->state; g->ix += g->n) {
+            const sdr_buff_t *buff = rcv->buff[g->rf_ch];
+            int njob = 0, ib = rcv->N * (int)(g->ix % MAX_BUFF);
+            
+            for (int i = 0; i < g->nth; i++) {
+                sdr_ch_th_t *th = g->th[i];
+                sdr_mutex_lock(&th->mtx);
+                
+                // catch up to the epoch of group (after acquisition)
+                while (th->ix < g->ix && th->ch->state == SDR_STATE_LOCK) {
+                    ch_th_update(th);
+                }
+                if (th->ch->state != SDR_STATE_LOCK || th->ix != g->ix) {
+                    sdr_mutex_unlock(&th->mtx);
+                    continue;
+                }
+                if (sdr_ch_update_pre(th->ch, th->ix * SDR_CYC, buff, ib,
+                        jobs + njob)) {
+                    ths[njob++] = th; // locked until post
+                    continue;
+                }
+                ch_th_udpvt(th); // updated by sdr_ch_update_pre()
+                th->ix += g->n;
+                sdr_mutex_unlock(&th->mtx);
+            }
+            // batched tracking correlators
+            sdr_acc_corr_batch(jobs, njob);
+            
+            for (int i = 0; i < njob; i++) {
+                sdr_ch_update_post(ths[i]->ch, jobs + i);
+                ch_th_udpvt(ths[i]);
+                ths[i]->ix += g->n;
+                sdr_mutex_unlock(&ths[i]->mtx);
+            }
+        }
+        sdr_sleep_msec(TH_CYC);
+    }
+    return NULL;
+}
+
+// start batched correlator groups ---------------------------------------------
+static void grp_th_start(sdr_rcv_t *rcv)
+{
+    rcv->ngrp = 0;
+    for (int i = 0; i < rcv->nch; i++) {
+        sdr_ch_th_t *th = rcv->th[i];
+        int n = th->ch->N / rcv->N, j;
+        for (j = 0; j < rcv->ngrp; j++) {
+            grp_th_t *g = (grp_th_t *)rcv->grp[j];
+            if (g->rf_ch == th->ch->rf_ch && g->n == n) break;
+        }
+        if (j >= rcv->ngrp) {
+            grp_th_t *g = (grp_th_t *)sdr_malloc(sizeof(grp_th_t));
+            g->rcv = rcv;
+            g->rf_ch = th->ch->rf_ch;
+            g->n = n;
+            rcv->grp[rcv->ngrp++] = g;
+        }
+        grp_th_t *g = (grp_th_t *)rcv->grp[j];
+        g->th[g->nth++] = th;
+        th->batch = 1;
+    }
+    for (int i = 0; i < rcv->ngrp; i++) {
+        grp_th_t *g = (grp_th_t *)rcv->grp[i];
+        g->state = 1;
+        if (!sdr_thread_create(&g->thread, grp_thread, g)) g->state = 0;
+    }
+}
+
+// stop batched correlator groups ----------------------------------------------
+static void grp_th_stop(sdr_rcv_t *rcv)
+{
+    for (int i = 0; i < rcv->ngrp; i++) {
+        ((grp_th_t *)rcv->grp[i])->state = 0;
+    }
+    for (int i = 0; i < rcv->ngrp; i++) {
+        grp_th_t *g = (grp_th_t *)rcv->grp[i];
+        sdr_thread_join(g->thread);
+        sdr_free(g);
+        rcv->grp[i] = NULL;
+    }
+    rcv->ngrp = 0;
 }
 
 // start SDR receiver CH ---------------------------------------------------------
@@ -1436,6 +1569,9 @@ int sdr_rcv_start(sdr_rcv_t *rcv, int dev, void *dp, const int *types,
     for (int i = 0; i < rcv->nch; i++) {
         ch_th_start(rcv->th[i]);
     }
+    if (trk_batch) { // batched tracking correlators
+        grp_th_start(rcv);
+    }
     rcv->dev = dev;
     rcv->dp = dp;
     rcv->pvt = sdr_pvt_new(rcv);
@@ -1444,6 +1580,7 @@ int sdr_rcv_start(sdr_rcv_t *rcv, int dev, void *dp, const int *types,
     rcv->state = 1;
     if (!sdr_thread_create(&rcv->thread, rcv_thread, rcv)) {
         rcv->state = 0;
+        grp_th_stop(rcv);
         for (int i = 0; i < rcv->nch; i++) ch_th_stop(rcv->th[i]);
         for (int i = 0; i < rcv->nch; i++) sdr_thread_join(rcv->th[i]->thread);
         return 0;
@@ -1502,6 +1639,7 @@ void sdr_rcv_stop(sdr_rcv_t *rcv)
 {
     gtime_t stop_time = utc2gpst(timeget()); // GPST
     
+    grp_th_stop(rcv);
     for (int i = 0; i < rcv->nch; i++) {
         ch_th_stop(rcv->th[i]);
     }
@@ -1966,5 +2104,6 @@ void sdr_rcv_setopt(const char *opt, double value)
     else if (!strcmp(opt, "lost_th"    )) sdr_lost_th     = (int)value;
     else if (!strcmp(opt, "bump_jump"  )) sdr_bump_jump = (int)value;
     else if (!strcmp(opt, "max_acq"    )) sdr_max_acq     = value;
+    else if (!strcmp(opt, "trk_batch"  )) trk_batch       = (int)value;
     else fprintf(stderr, "sdr_rcv_setopt error opt=%s\n", opt);
 }

@@ -72,7 +72,7 @@ endif
 #CFLAGS = -O3 -march=native $(INCLUDE) $(OPTIONS) -Wall -fPIC -g
 CFLAGS = -O3 $(INCLUDE) $(OPTIONS) -Wall -fPIC -g
 
-OBJ = sdr_cmn.o sdr_func.o sdr_code.o sdr_code_gal.o sdr_ch.o \
+OBJ = sdr_cmn.o sdr_func.o sdr_acc.o sdr_code.o sdr_code_gal.o sdr_ch.o \
       sdr_nav.o sdr_pvt.o sdr_rcv.o sdr_fec.o sdr_ldpc.o sdr_nb_ldpc.o \
       sdr_usb.o sdr_dev.o sdr_conf.o sdr_sdev.o sdr_array.o sdr_web.o
 
@@ -87,6 +87,8 @@ libsdr.a: $(OBJ)
 sdr_cmn.o : $(SRC)/sdr_cmn.c
 	$(CC) -c $(CFLAGS) $<
 sdr_func.o : $(SRC)/sdr_func.c
+	$(CC) -c $(CFLAGS) $<
+sdr_acc.o : $(SRC)/sdr_acc.c
 	$(CC) -c $(CFLAGS) $<
 sdr_code.o : $(SRC)/sdr_code.c
 	$(CC) -c $(CFLAGS) $<
@@ -121,6 +123,7 @@ sdr_web.o : $(SRC)/sdr_web.c
 
 sdr_cmn.o  : $(SRC)/pocket_sdr.h
 sdr_func.o : $(SRC)/pocket_sdr.h
+sdr_acc.o  : $(SRC)/pocket_sdr.h $(SRC)/sdr_acc.h
 sdr_code.o : $(SRC)/pocket_sdr.h
 sdr_ch.o   : $(SRC)/pocket_sdr.h
 sdr_nav.o  : $(SRC)/pocket_sdr.h

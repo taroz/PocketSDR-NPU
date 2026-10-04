@@ -26,6 +26,7 @@
 //  2026-07-24  1.18 support up to 8 output streams with selectable types
 //  2026-08-01  1.19 add Web UI server APIs (sdr_web.c)
 //  2026-08-02  1.20 add Web UI receiver configuration and lifecycle APIs
+//  2026-10-02  1.21 add accelerator backend APIs (sdr_acc.c)
 //
 #ifndef POCKET_SDR_H
 #define POCKET_SDR_H
@@ -112,6 +113,9 @@ extern "C" {
 
 #define SDR_FFT_FORWARD 0       // SDR FFT direction forward
 #define SDR_FFT_BACKWARD 1      // SDR FFT direction backward
+#define SDR_ACC_CPU    0        // accelerator backend: CPU reference
+#define SDR_ACC_CPUOPT 1        // accelerator backend: CPU optimized
+#define SDR_ACC_PLUGIN 2        // accelerator backend: plugin (NPU etc.)
 
 #define SDR_CALIB_BOTH 0        // calib mode: estimate rpy + bias
 #define SDR_CALIB_BIAS 1        // calib mode: estimate bias only (rpy=0 fixed)
@@ -270,6 +274,32 @@ typedef struct {                // IF data buffer type
     int IQ, N;                  // sampling types (1:I,2:IQ) and buffer size
 } sdr_buff_t;
 
+typedef struct {                // tracking correlator job type
+    const sdr_buff_t *buff;     // IF data buffer
+    int ix, N;                  // start index and length of IF data
+    double fs, fc, phi;         // sampling freq (Hz), IF carrier freq (Hz),
+                                // IF carrier phase (cyc)
+    const int8_t *code;         // resampled code bank (N x SDR_N_CODES)
+    const int32_t *code_sum;    // prefix sums of code bank
+    int scale;                  // code amplitude scale
+    double coff;                // code offset (samples)
+    const double *pos;          // correlator positions (samples)
+    int npos;                   // number of correlators
+    sdr_cpx_t *corr;            // correlations (npos x 1) (output)
+    sdr_cpx_t C[2];             // P correlations before and after code
+                                // wrap-around (output)
+} sdr_corr_job_t;
+
+typedef struct {                // accelerator backend statistics type
+    int64_t ncall;              // number of accelerated calls
+    int64_t nfall;              // number of CPU fallback calls
+    int64_t njob;               // number of tracking correlator jobs
+    double t_total;             // total time of accelerated calls (s)
+    double t_conv;              // IF data to tensor conversion time (s)
+    double t_in, t_exec, t_out; // backend input/execution/output time (s)
+    double bytes_in, bytes_out; // backend input/output tensor bytes
+} sdr_acc_stat_t;
+
 typedef struct {                // SDR IF data statistics
     double std;                 // IF data std-dev
     double rate, sum;           // IF data rate (MB/s) and total size (MB)
@@ -288,6 +318,8 @@ typedef struct {                // SDR receiver channel thread type
     int64_t ix;                 // IF data buffer read pointer (cyc)
     struct sdr_rcv_tag *rcv;    // pointer to SDR receiver
     sdr_thread_t thread;        // SDR receiver channel thread
+    int batch;                  // tracked by batched correlator group (0/1)
+    sdr_mutex_t mtx;            // lock of channel update (batched correlator)
 } sdr_ch_th_t;
 
 typedef struct {                // SDR PVT type
@@ -394,6 +426,8 @@ typedef struct sdr_rcv_tag {    // SDR receiver type
     double tscale;              // time scale to replay IF data file
     char opt[1024];             // receiver options
     int fast_acq;               // fast acquisition flag (0:off, 1:on)
+    int ngrp;                   // number of batched correlator groups
+    void *grp[SDR_MAX_NCH];     // batched correlator groups
     sdr_thread_t thread;        // SDR receiver thread
     sdr_mutex_t mtx;            // lock flag
 } sdr_rcv_t;
@@ -468,6 +502,12 @@ int sdr_tag_read(const char *file, char *prog, gtime_t *time, int *fmt,
 void sdr_search_code(const sdr_cpx_t *code_fft, double T,
     const sdr_buff_t *buff, int ix, int N, double fs, double fi,
     const float *fds, int len_fds, float *P);
+void sdr_search_code2(const sdr_cpx_t *code_fft, double T,
+    const sdr_buff_t *buff, int ix, int N, int Nmax, double fs, double fi,
+    const float *fds, int len_fds, float *P);
+void sdr_search_code_cpu(const sdr_cpx_t *code_fft, double T,
+    const sdr_buff_t *buff, int ix, int N, double fs, double fi,
+    const float *fds, int len_fds, float *P);
 float sdr_corr_max(const float *P, int N, int Nmax, int M, double T, int *ix);
 double sdr_fine_dop(const float *P, int N, const float *fds, int len_fds,
     const int *ix);
@@ -520,6 +560,20 @@ sdr_lpf_t *sdr_lpf_new(double fc, double fs);
 void sdr_lpf_free(sdr_lpf_t *lpf);
 void sdr_lpf_apply(sdr_lpf_t *lpf, sdr_cpx8_t *data, int N);
 
+// sdr_acc.c
+int sdr_acc_init(const char *backend);
+void sdr_acc_exit(void);
+int sdr_acc_type(const char **name);
+void sdr_acc_stat(sdr_acc_stat_t *stat, int reset);
+int sdr_acc_search_code(const sdr_cpx_t *code_fft, double T,
+    const sdr_buff_t *buff, int ix, int N, int Nmax, double fs, double fi,
+    const float *fds, int len_fds, float *P);
+int sdr_acc_trk_init(const char *backend);
+void sdr_acc_trk_exit(void);
+int sdr_acc_trk_type(const char **name);
+void sdr_acc_trk_stat(sdr_acc_stat_t *stat, int reset);
+void sdr_acc_corr_batch(sdr_corr_job_t *jobs, int njob);
+
 // sdr_code.c
 int8_t *sdr_gen_code(const char *sig, int prn, int *N);
 int8_t *sdr_sec_code(const char *sig, int prn, int *N);
@@ -540,6 +594,9 @@ void sdr_gen_code_fft(const int8_t *code_I, const int8_t *code_Q, int len_code,
 sdr_ch_t *sdr_ch_new(const char *sig, int prn, double fs, double fi);
 void sdr_ch_free(sdr_ch_t *ch);
 void sdr_ch_update(sdr_ch_t *ch, double time, const sdr_buff_t *buff, int ix);
+int sdr_ch_update_pre(sdr_ch_t *ch, double time, const sdr_buff_t *buff,
+    int ix, sdr_corr_job_t *job);
+void sdr_ch_update_post(sdr_ch_t *ch, sdr_corr_job_t *job);
 void sdr_ch_set_corr(sdr_ch_t *ch, int nposx, double width);
 int sdr_ch_corr_stat(sdr_ch_t *ch, double *stat, double *pos, sdr_cpx_t *C,
     double *P, double *I);

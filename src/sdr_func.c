@@ -63,6 +63,8 @@
 //  2026-07-24  1.30 support multiple log streams
 //                   add API sdr_log_add_str(), sdr_log_rm_str()
 //  2026-08-08  1.31 fix memory leak of stream in sdr_str_close()
+//  2026-10-02  1.32 dispatch sdr_search_code() to accelerator backend
+//                   add API sdr_search_code2(), sdr_search_code_cpu()
 //
 #include <math.h>
 #include <stdarg.h>
@@ -722,7 +724,33 @@ int sdr_tag_read(const char *file, char *prog, gtime_t *time, int *fmt,
 //  return:
 //      none
 //
+//  notes:
+//      The search is processed by the accelerator backend selected by
+//      sdr_acc_init(). The CPU reference sdr_search_code_cpu() is used for the
+//      CPU backend or the shapes not supported by the backend.
+//
 void sdr_search_code(const sdr_cpx_t *code_fft, double T,
+    const sdr_buff_t *buff, int ix, int N, double fs, double fi,
+    const float *fds, int len_fds, float *P)
+{
+    sdr_search_code2(code_fft, T, buff, ix, N, N, fs, fi, fds, len_fds, P);
+}
+
+// parallel code search for code offsets < Nmax (P[i*N+j] (j >= Nmax) may not
+// be updated) -----------------------------------------------------------------
+void sdr_search_code2(const sdr_cpx_t *code_fft, double T,
+    const sdr_buff_t *buff, int ix, int N, int Nmax, double fs, double fi,
+    const float *fds, int len_fds, float *P)
+{
+    if (sdr_acc_search_code(code_fft, T, buff, ix, N, Nmax, fs, fi, fds,
+        len_fds, P)) {
+        return;
+    }
+    sdr_search_code_cpu(code_fft, T, buff, ix, N, fs, fi, fds, len_fds, P);
+}
+
+// parallel code search by CPU (reference) -------------------------------------
+void sdr_search_code_cpu(const sdr_cpx_t *code_fft, double T,
     const sdr_buff_t *buff, int ix, int N, double fs, double fi,
     const float *fds, int len_fds, float *P)
 {

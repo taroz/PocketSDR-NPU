@@ -38,6 +38,9 @@
 //  2026-07-19  1.25 add pre-combined E5ABQ replicas (a+b, a-b) to correlate
 //                   both sidebands in one pass once the polarity is calibrated
 //  2026-07-19  1.26 improve low-C/N0 acquisition and pilot tracking
+//  2026-10-02  1.27 search code offsets < N only by sdr_search_code2()
+//  2026-10-03  1.28 separate tracking correlator for batched correlators
+//                   add API sdr_ch_update_pre(), sdr_ch_update_post()
 //
 #include <ctype.h>
 #include <math.h>
@@ -560,8 +563,8 @@ static void search_sig(sdr_ch_t *ch, double time, const sdr_buff_t *buff,
         ch->acq->P_sum = (float *)sdr_malloc(sizeof(float) * 2 * ch->N * n);
     }
     // parallel code search and non-coherent integration
-    sdr_search_code(ch->acq->code_fft, ch->T, buff, ix, 2 * ch->N, ch->fs,
-        ch->fi, fds, n, ch->acq->P_sum);
+    sdr_search_code2(ch->acq->code_fft, ch->T, buff, ix, 2 * ch->N, ch->N,
+        ch->fs, ch->fi, fds, n, ch->acq->P_sum);
     ch->acq->n_sum++;
     
     double t_acq = assisted ? sdr_t_acq_ext : sdr_t_acq;
@@ -859,8 +862,8 @@ static void adj_coff(sdr_ch_t *ch)
     }
 }
 
-// track signal ----------------------------------------------------------------
-static void track_sig(sdr_ch_t *ch, double time, const sdr_buff_t *buff, int ix)
+// predict carrier phase and code offset of tracking -------------------------
+static void track_pred(sdr_ch_t *ch, double time)
 {
     double tau = time - ch->time;   // time interval (s) 
     double fc = ch->fi + ch->fd;    // IF carrier frequency with Doppler (Hz)
@@ -872,41 +875,32 @@ static void track_sig(sdr_ch_t *ch, double time, const sdr_buff_t *buff, int ix)
     
     // adjust code offset
     adj_coff(ch);
-    
-    if (!strcmp(ch->sig, "L6D") || !strcmp(ch->sig, "L6E")) {
-        int i = (int)floor(ch->coff * ch->fs);
-        
-        // mix carrier
-        sdr_mix_carr(buff, ix + i, ch->N, ch->fs, fc, ch->phi + fc * i / ch->fs,
-            ch->data);
-        
-        // decode L6 CSK
-        int csk = CSK(ch, ch->data, ch->coff * ch->fs - i);
-        
-        // standard correlator with CSK-shifted code (carrier mixing fused)
-        // (fixed code polarity: window is symbol-aligned and circular)
-        double R = (double)ch->N / (ch->len_code / 2); // samples / chip
-        sdr_cpx_t C1[2];
-        sdr_corr_std(buff, ix + i, ch->N, ch->fs, fc,
-            ch->phi + fc * i / ch->fs, ch->trk->code, ch->trk->code_sum,
-            NULL, NULL, ch->trk->code_scale, ch->coff * ch->fs - i + csk * R,
-            ch->trk->pos, ch->trk->npos + ch->trk->nposx, 1, ch->trk->C, C1);
-        
-        // add P correlator outputs to history 
-        sdr_add_buff(ch->trk->P, SDR_N_HIST, ch->trk->C[0], sizeof(sdr_cpx_t));
-    } else {
-        sdr_cpx_t C1[2];
-        
-        if (!strcmp(ch->sig, "E5ABQ")) {
-            // correlate E5aQ/E5bQ sidebands separately and combine them
-            corr_e5abq(ch, buff, ix, fc, C1);
-        } else {
-            // standard correlator (carrier mixing fused)
-            sdr_corr_std(buff, ix, ch->N, ch->fs, fc, ch->phi, ch->trk->code,
-                ch->trk->code_sum, NULL, NULL, ch->trk->code_scale,
-                ch->coff * ch->fs, ch->trk->pos,
-                ch->trk->npos + ch->trk->nposx, 0, ch->trk->C, C1);
-        }
+}
+
+// set standard correlator job of tracking -------------------------------------
+static void track_job(sdr_ch_t *ch, const sdr_buff_t *buff, int ix,
+    sdr_corr_job_t *job)
+{
+    job->buff = buff;
+    job->ix = ix;
+    job->N = ch->N;
+    job->fs = ch->fs;
+    job->fc = ch->fi + ch->fd;
+    job->phi = ch->phi;
+    job->code = ch->trk->code;
+    job->code_sum = ch->trk->code_sum;
+    job->scale = ch->trk->code_scale;
+    job->coff = ch->coff * ch->fs;
+    job->pos = ch->trk->pos;
+    job->npos = ch->trk->npos + ch->trk->nposx;
+    job->corr = ch->trk->C;
+}
+
+// update tracking loops by correlations ---------------------------------------
+//   C1: P correlations before and after code wrap-around (NULL: L6D/L6E)
+static void track_update(sdr_ch_t *ch, sdr_cpx_t *C1)
+{
+    if (C1) {
         for (int i = 0; i < 2; i++) {
             C1[0][i] = (C1[0][i] + ch->trk->C1[i]) / ch->N;
             ch->trk->C1[i] = C1[1][i];
@@ -969,6 +963,67 @@ static void track_sig(sdr_ch_t *ch, double time, const sdr_buff_t *buff, int ix)
     }
 }
 
+// standard correlator signal (batched correlator applicable) ? ----------------
+static int std_corr_sig(const sdr_ch_t *ch)
+{
+    return strcmp(ch->sig, "L6D") && strcmp(ch->sig, "L6E") &&
+        strcmp(ch->sig, "E5ABQ");
+}
+
+// track signal ----------------------------------------------------------------
+static void track_sig(sdr_ch_t *ch, double time, const sdr_buff_t *buff, int ix)
+{
+    double fc = ch->fi + ch->fd;    // IF carrier frequency with Doppler (Hz)
+    
+    // predict carrier phase and code offset
+    track_pred(ch, time);
+    
+    if (!strcmp(ch->sig, "L6D") || !strcmp(ch->sig, "L6E")) {
+        int i = (int)floor(ch->coff * ch->fs);
+        
+        // mix carrier
+        sdr_mix_carr(buff, ix + i, ch->N, ch->fs, fc, ch->phi + fc * i / ch->fs,
+            ch->data);
+        
+        // decode L6 CSK
+        int csk = CSK(ch, ch->data, ch->coff * ch->fs - i);
+        
+        // standard correlator with CSK-shifted code (carrier mixing fused)
+        // (fixed code polarity: window is symbol-aligned and circular)
+        double R = (double)ch->N / (ch->len_code / 2); // samples / chip
+        sdr_cpx_t C1[2];
+        sdr_corr_std(buff, ix + i, ch->N, ch->fs, fc,
+            ch->phi + fc * i / ch->fs, ch->trk->code, ch->trk->code_sum,
+            NULL, NULL, ch->trk->code_scale, ch->coff * ch->fs - i + csk * R,
+            ch->trk->pos, ch->trk->npos + ch->trk->nposx, 1, ch->trk->C, C1);
+        
+        // add P correlator outputs to history 
+        sdr_add_buff(ch->trk->P, SDR_N_HIST, ch->trk->C[0], sizeof(sdr_cpx_t));
+        
+        // update tracking loops
+        track_update(ch, NULL);
+    } else if (!strcmp(ch->sig, "E5ABQ")) {
+        sdr_cpx_t C1[2];
+        
+        // correlate E5aQ/E5bQ sidebands separately and combine them
+        corr_e5abq(ch, buff, ix, fc, C1);
+        
+        // update tracking loops
+        track_update(ch, C1);
+    } else {
+        sdr_corr_job_t job;
+        
+        // standard correlator (carrier mixing fused)
+        track_job(ch, buff, ix, &job);
+        sdr_corr_std(job.buff, job.ix, job.N, job.fs, job.fc, job.phi,
+            job.code, job.code_sum, NULL, NULL, job.scale, job.coff, job.pos,
+            job.npos, 0, job.corr, job.C);
+        
+        // update tracking loops
+        track_update(ch, job.C);
+    }
+}
+
 //------------------------------------------------------------------------------
 //  Update a receiver channel. A receiver channel is a state machine which has
 //  the following internal states indicated as ch.state. By calling the function,
@@ -1002,6 +1057,62 @@ void sdr_ch_update(sdr_ch_t *ch, double time, const sdr_buff_t *buff, int ix)
         track_sig(ch, time, buff, ix);
         sdr_mutex_unlock(&ch->mtx);
     }
+}
+
+//------------------------------------------------------------------------------
+//  Update a receiver channel with the tracking correlator separated for batched
+//  correlators (sdr_acc_corr_batch()). The update is equivalent to
+//  sdr_ch_update() by the calls:
+//
+//    if (sdr_ch_update_pre(ch, time, buff, ix, &job)) {
+//        (standard correlator of job, e.g. by sdr_acc_corr_batch())
+//        sdr_ch_update_post(ch, &job);
+//    }
+//
+//  sdr_ch_update_pre() predicts the carrier phase and code offset of the
+//  tracking channel and sets the correlator job. For the channels not in
+//  tracking state or signals with special correlators (L6D, L6E, E5ABQ), the
+//  channel is updated by sdr_ch_update() and no job is set. The channel is
+//  locked from sdr_ch_update_pre() to sdr_ch_update_post().
+//
+//  args:
+//      ch       (I)  Receiver channel
+//      time     (I)  Sampling time of the end of digitized IF data (s)
+//      buff     (I)  IF data buffer
+//      ix       (I)  index of IF data buffer
+//      job      (O)  correlator job
+//
+//  return:
+//      Correlator job set (1: set, 0: not set (updated by sdr_ch_update()))
+//
+int sdr_ch_update_pre(sdr_ch_t *ch, double time, const sdr_buff_t *buff,
+    int ix, sdr_corr_job_t *job)
+{
+    if (ch->state != SDR_STATE_LOCK || !std_corr_sig(ch)) {
+        sdr_ch_update(ch, time, buff, ix);
+        return 0;
+    }
+    sdr_mutex_lock(&ch->mtx);
+    track_pred(ch, time);
+    track_job(ch, buff, ix, job);
+    return 1;
+}
+
+//------------------------------------------------------------------------------
+//  Update tracking loops of a receiver channel by the correlations of the
+//  correlator job set by sdr_ch_update_pre().
+//
+//  args:
+//      ch       (I)  Receiver channel
+//      job      (I)  correlator job with correlations (job->corr, job->C)
+//
+//  return:
+//      none
+//
+void sdr_ch_update_post(sdr_ch_t *ch, sdr_corr_job_t *job)
+{
+    track_update(ch, job->C);
+    sdr_mutex_unlock(&ch->mtx);
 }
 
 // set receiver channel correlator ---------------------------------------------
