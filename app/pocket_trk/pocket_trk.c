@@ -28,6 +28,8 @@
 //                   -log and -raw options
 //  2026-08-02  1.12 add -arch and -geom options for antenna array
 //  2026-08-07  1.13 close the SDR device on console close for Windows
+//  2026-10-02  1.14 add -acc option for accelerator backend
+//  2026-10-03  1.15 add -tacc option for batched tracking correlator backend
 //
 #include <math.h>
 #include <signal.h>
@@ -56,7 +58,7 @@ static const char *usage_text[] = {
     "       [-toff toff] [-ti tint] [-p bus,[,port] [-c conf_file]",
     "       [-driver name] [-gain gain] [-bw bw] [-fd dopp]",
     "       [-log path] [-nmea path] [-rtcm path] [-raw path] ... [-opt file]",
-    "       [-arch nch] [-geom file] [file]",
+    "       [-arch nch] [-geom file] [-acc backend] [-tacc backend] [file]",
     NULL
 };
 
@@ -192,6 +194,26 @@ static int print_rcv_stat(sdr_rcv_t *rcv, int nrow, int max_row)
     return n;
 }
 
+// print accelerator backend statistics ----------------------------------------
+static void print_acc_stat(void)
+{
+    sdr_acc_stat_t st;
+    const char *name;
+    if (sdr_acc_type(&name) != SDR_ACC_CPU) {
+        sdr_acc_stat(&st, 0);
+        fprintf(stderr, "ACC(%s): calls=%lld fallback=%lld time=%.3f s "
+            "(exec=%.3f s)\n", name, (long long)st.ncall, (long long)st.nfall,
+            st.t_total, st.t_exec);
+    }
+    sdr_acc_trk_stat(&st, 0);
+    if (st.ncall > 0) {
+        sdr_acc_trk_type(&name);
+        fprintf(stderr, "TACC(%s): batches=%lld jobs=%lld fallback=%lld "
+            "time=%.3f s (exec=%.3f s)\n", name, (long long)st.ncall,
+            (long long)st.njob, (long long)st.nfall, st.t_total, st.t_exec);
+    }
+}
+
 // main ------------------------------------------------------------------------
 // Command spec: see doc/command_ref.md.
 int main(int argc, char **argv)
@@ -214,6 +236,7 @@ int main(int argc, char **argv)
     double gain = 0.0, bw = 0.0, max_dop = 0.0;
     char rfch_opt[1024] = "-RFCH";
     const char *geom_file = "";
+    const char *acc = "cpu", *tacc = "";
 
     for (int i = 1; i < argc; i++) {
         if (!strcmp(argv[i], "-sig") && i + 1 < argc) {
@@ -293,6 +316,10 @@ int main(int argc, char **argv)
                 atoi(argv[++i]));
         } else if (!strcmp(argv[i], "-geom") && i + 1 < argc) {
             geom_file = argv[++i];
+        } else if (!strcmp(argv[i], "-acc") && i + 1 < argc) {
+            acc = argv[++i];
+        } else if (!strcmp(argv[i], "-tacc") && i + 1 < argc) {
+            tacc = argv[++i];
         } else if (!strcmp(argv[i], "-v")) {
             print_ver();
         } else if (argv[i][0] == '-') {
@@ -312,6 +339,17 @@ int main(int argc, char **argv)
         sdr_rcv_setopt("max_dop", max_dop);
     }
     sdr_func_init(fftw_wisdom);
+    if (!sdr_acc_init(acc)) {
+        fprintf(stderr, "accelerator backend error: %s\n", acc);
+        return -1;
+    }
+    if (*tacc) { // batched tracking correlators
+        if (!sdr_acc_trk_init(tacc)) {
+            fprintf(stderr, "tracking accelerator backend error: %s\n", tacc);
+            return -1;
+        }
+        sdr_rcv_setopt("trk_batch", 1);
+    }
     
     signal(SIGTERM, sig_func);
     signal(SIGINT, sig_func);
@@ -367,6 +405,9 @@ int main(int argc, char **argv)
         printf("%s", ESC_VCUR);
     }
     sdr_rcv_close(rcv);
+    print_acc_stat();
+    sdr_acc_trk_exit();
+    sdr_acc_exit();
     
     if (*debug_file) {
         traceclose();

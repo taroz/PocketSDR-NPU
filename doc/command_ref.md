@@ -245,7 +245,7 @@ auto-configure.
 ```
 pocket_acq [-sig sig] [-prn prn[,...]] [-tint tint] [-toff toff]
            [-fmt {INT8|INT8X2|CS8|CS16}] [-f freq] [-fi freq]
-           [-d freq[,freq]] [-nz]
+           [-d freq[,freq]] [-nz] [-acc backend]
            [-w file] [-v] file
 ```
 
@@ -279,6 +279,11 @@ If a tag file `<file>.tag` exists alongside the input, the IF format, sampling f
   - Reference and maximum Doppler frequency to search in Hz. [`0.0,5000.0`]
 - `-nz`
   - Disable zero-padding for circular correlation. [enabled]
+- `-acc backend`
+  - Acquisition backend of the parallel code search: `cpu` (CPU reference),
+    `cpu_opt` (CPU, DFT of IF data shared by Doppler bins), `npu` (OpenVINO
+    plugin on Intel NPU) or `<plugin>[:<opt>]` (e.g. `ov:NPU,direct`). See
+    `doc/npu_architecture.md`. [`cpu`]
 - `-w file`
   - FFTW wisdom file. [`../python/fftw_wisdom.txt`]
 - `-v`
@@ -307,7 +312,7 @@ pocket_trk [-sig sig -prn prn[,...] [-rfch ch[,...]] ...]
            [-p bus[,port]] [-c conf_file]
            [-driver name] [-gain gain] [-bw bw] [-fd dopp]
            [-log path] [-nmea path] [-rtcm path] [-raw path] ...
-           [-arch nch] [-geom file]
+           [-arch nch] [-geom file] [-acc backend] [-tacc backend]
            [-h height] [-opt file] [-debug file] [-v] [file]
 ```
 
@@ -369,6 +374,14 @@ The input can be a local file, a TCP stream, a Pocket SDR FE device, or a SoapyS
 - `-geom file`
   - Array element positions file (body-frame, `pocket_sdr.py` array
     geometry format) applied at startup. [none]
+- `-acc backend`
+  - Acquisition backend (see `pocket_acq`). [`cpu`]
+- `-tacc backend`
+  - Enable batched tracking correlators with the tracking backend: `cpu`
+    (CPU reference), `cpu_mt[:n]` (CPU, n threads), `npu` (OpenVINO plugin on
+    Intel NPU) or `<plugin>[:<opt>]`. The tracking channels of the same RF
+    channel and code period are correlated in a batch per epoch. See
+    `doc/npu_architecture.md`. [none (channel threads)]
 - `-h height`
   - Console height (rows) for the runtime status display. [`64`]
 - `-opt file`
