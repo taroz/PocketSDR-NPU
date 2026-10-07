@@ -630,7 +630,8 @@ PRNs per inference).
 ### 13.1 Platform and measurement conditions
 
 - Radxa ROCK 5B (RK3588: 4x Cortex-A76 2.3 GHz + 4x Cortex-A55 1.8 GHz,
-  NPU 3 cores, 8 GB LPDDR4x), heatsink without fan, Radxa Debian 12, kernel
+  NPU 3 cores, 8 GB LPDDR4x), heatsink (13.1-13.7) and heatsink with fan
+  (13.8-), Radxa Debian 12, kernel
   6.1, RKNPU driver 0.9.8, RKNN runtime (librknnrt) 2.3.0. Desktop stopped
   (multi-user.target). Built natively with `-mcpu=native` (NEON).
 - CPU governor `performance`, and the devfreq governors of the DDR (`dmc`)
@@ -647,8 +648,9 @@ echo performance | sudo tee /sys/class/devfreq/fdab0000.npu/governor
 
 - Single-core results are pinned by `taskset` (A76: core 4, A55: core 0). The
   temperature stayed below 69 C (SoC) and the clocks never dropped.
-- Recorded IF data: first 10 s of the data set of section 5 (the SBC has the
-  first 640 MB only).
+- Recorded IF data: the data set of section 5; the first 10 s on the SD
+  card (13.1-13.7, benches), the full 300 s from a NAS (13.8-13.9, real-time
+  replay at 64 MB/s, see 13.8).
 
 ### 13.2 Plugin (libsdr_acc_rknn.so)
 
@@ -666,7 +668,10 @@ bins, while 3 contexts in parallel take 9.6 ms). Two implementations:
    as the CPU reference (carrier wipe-off and DFT for each bin, no shared
    DFT). Model kinds (searched in this order):
    - `_fq` (option `int8`): INT8 of `_f` (section 13.5).
-   - `_f` (default, `gen_rknn_acq.py -f`): carrier folded into the DFT
+   - `_s` (default, `gen_rknn_acq.py -s`, option `noshift`: not used): shared
+     DFT (shift mode, section 13.13). Input: IF samples wiped by the carrier of
+     the first bin of the chunk, the code DFT of bin k rolled by k bins.
+   - `_f` (`gen_rknn_acq.py -f`): carrier folded into the DFT
      (section 13.3). Input: IF samples wiped by the carrier of the first bin
      of the chunk (host), the code DFT replicated along W. Needs bins spaced
      by fs / M (PocketSDR: 0.5 / T); otherwise `_w` is used.
@@ -709,6 +714,20 @@ xr, xi [Kc][n1][1][n2]  -> Conv F_A -> twiddle -> Transpose -> Conv F_B
   axis as H instead of W is slower (12.2 ms).
 - The output power is scaled by 1/64 in the model to stay in the FP16 range
   (|c|^2 up to M for unit-RMS input).
+- Chunks: the bins per inference Kc are limited by Kc x A <= 16384 (the
+  first Conv has Kc x A output channels; a model for the L2CM direct search
+  in one chunk per core, M=640000 Kc=134, needs 864 MB of NPU memory per
+  context and fails to allocate the IOVA), and the chunks are processed in
+  rounds of the 3 NPU cores (e.g. L1CP 201 bins: 9 chunks of 23, L2CM 401
+  bins: 21 chunks of 20). The DFT factorization M = A x B takes the largest
+  A <= sqrt(M) with B % 4 = 0 (M=320000: 500 x 640; with 512 x 625 the
+  native layout of the odd width gave a wrong correlation, peak -4.6 dB).
+- Models used by `pocket_trk` and the benches (16 MHz): 32000:7, 128000:27
+  (full search of 1 / 4 ms codes, 21 / 81 bins), 32000:29 (85 bins), 8000:7
+  (4 MHz, `test_sdr_acc`), 320000:23, 640000:20 (direct search of L1C / L2CM,
+  section 13.10), and Kc = 1 for M = 32000, 128000, 320000, 640000 (assisted
+  acquisition, 3 bins: one bin per core; without them the assisted searches of
+  the receiver used the matmul API, which costs as much CPU as the FFT).
 - RKNN matmul API: FP16 400 GFLOPS per NPU core with an explicit core mask
   (190 GFLOPS with the default auto mode), ~0.1 ms per call. The native
   layout conversion of B (`rknn_B_normal_layout_to_native_layout()`) does not
@@ -873,7 +892,7 @@ Channels in real time (1 ms batch, 4 taps): 1 A76 ~45, 4 A76 ~170, 8 cores
 ~150-190, 4 A55 ~38. `quick_trk.sh` (33 channels L1CA/E1B/B1I, 1 s): `cpu`
 and `cpu_mt` bit-identical to the original channel update on all core sets.
 
-### 13.7 End-to-end receiver (pocket_trk, 10 s, 10 signal types, 309 channels, 8 cores)
+### 13.7 End-to-end receiver (pocket_trk, first 10 s, 10 signal types, 309 channels, 8 cores)
 
 | `-acc` / `-tacc` | wall (s) | user CPU (s) | sys (s) | SIGNAL FOUND / LOST |
 |------------------|----------|--------------|---------|---------------------|
@@ -900,17 +919,243 @@ on the A76 instead of cpu_mt:8 on all cores), acquisition 13.9 -> 13.0 ms per
 call (NPU bound, not slower on the A55). Without `-tacc` the locked channel
 threads move to 4-7.
 
-### 13.8 Findings
+### 13.8 End-to-end receiver on the full data (300 s)
+
+Conditions: the full IF data set (19.2 GB, 300 s), read from a NAS (SMB 3.0,
+1GbE, 118 MB/s) at the real-time rate 64 MB/s. The SD card of the ROCK 5B
+(90 MB/s) was saturated by the 64 MB/s replay under a high CPU load (SD
+utilization 90-97%, the IF input thread waiting for the block I/O), which
+limited the first capacity runs at ~150 channels; with the NAS the input
+thread does not wait for the I/O. Real time = the 300 s data processed in
+~302-305 s of wall time (`pocket_trk` file input waits when ahead and falls
+behind when the input thread cannot keep up). Fan cooling (max 60 C, no
+throttling).
+
+10 signal types of `acq_sigs.sh` (309 candidates, data components only):
+
+| configuration | search cycle of 309 ch | LOCK at 300 s | sats used / valid | max BUFF | user CPU |
+|---|---|---|---|---|---|
+| `-acc cpu` (PocketFFT) | ~240 s | 66 | 33 / 54 | 27% | 17.1 min |
+| `-acc rknn` | ~115 s | 73 | 33 / 55 | 11% | 18.2 min |
+| `-acc rknn -cpu_acq 0-3 -cpu_trk 4-7` | ~115 s | 73 | 33 / 53 | 13% | 12.4 min |
+| `-acc rknn -tacc cpu_mt` (+ affinity) | ~120 s | 72 | 17 / 23 | 93% | 11.2 min |
+| `-acc cpu -tacc cpu_mt` | ~240 s | 52 | 12 / 24 | 95% | 14.5 min |
+
+The NPU halves the search cycle; with the A55 for the acquisition (A55 15%,
+A76 64-69%) the CPU time is -27%. The batched tracking correlators (`-tacc`)
+do not scale to this size: one group thread per (RF channel, code period)
+runs the non-correlator parts of all its channels serially (`sdr_ch_update_pre`
+/ `post`), the IF buffer usage reaches 93-95% and the PVT loses satellites.
+On the CPU the batch has no benefit per channel (Raspberry Pi 5: 30.5 vs 30.7
+us per channel-epoch), so the channel threads are the better CPU design.
+
+### 13.9 All-in-view capacity
+
+All-in-view signal set: the visible satellites of the data (GPS 9, Galileo
+7, BeiDou 19, GLONASS 6, QZSS 4) x all supported signals incl. the pilots in
+the 8 RF channels (L1CA, L1CD/P, E1B/C, B1CD/P, B1I, G1CA, L2CM, G2CA, L5I/Q,
+E5aI/Q, B2aD/P, E5bI/Q, B2I, B2bI, L6D, E6B/C; 232 candidates): 185 signals
+found, 176 locked at the end (`cand_sigs.sh`). L6D/L6E are excluded from the
+capacity runs (the CSK demodulation by a chip-domain FFT per code period
+costs 0.23 core per channel, 6x of the other signals).
+
+Capacity runs: N tracked signals (stratified by signal type from the 172
+locked signals except L6D; N > 172 by duplicated channels) + 227 never
+detected candidates of `acq_sigs.sh` searched continuously (one search at a
+time), `capx_N.sh`. The CPU-only reference is FFTW with wisdom of all DFT
+sizes (`USE_FFTW=1`, PATIENT/MEASURE wisdom of 32000, 128000, 320000,
+640000; the FFT of the tracking is only the L6 CSK).
+
+| N | configuration | wall (s) | LOCK at end | CPU (A55 / A76) | user CPU | max BUFF |
+|---|---|---|---|---|---|---|
+| 125 | FFTW | 304 | 118 | 75% | 27.1 min | 23% |
+| 125 | rknn | 304 | 113 | 67% | 23.6 min | 12% |
+| 125 | rknn, acq on A55 | 304 | 118 | 67% | 23.1 min | 13% |
+| 150 | FFTW | 304 | 139 | 83% | 29.5 min | 29% |
+| 150 | rknn | 305 | 138 | 78% | 27.3 min | 11% |
+| 150 | rknn, acq on A55 | 305 | 140 | 77% | 26.2 min | 14% |
+| 172 | FFTW | 304 | 162 | 88% (89 / 87) | 31.0 min | 28% |
+| 172 | rknn | 305 | 164 | 88% (90 / 87) | 30.4 min | 13% |
+| 172 | rknn, acq on A55 | 305 | 160 | 85% (88 / 83) | 28.6 min | 11% |
+| 200 | FFTW | 304 | 167 | 93% | 32.4 min | 46% |
+| 200 | rknn | 312 | 187 | 95% | 32.7 min | 18% |
+| 200 | rknn, acq on A55 | 305 | 186 | 90% | 30.3 min | 23% |
+| 230 | FFTW | 318 | 189 | 95% | 34.4 min | 66% |
+| 230 | rknn | 335 | 220 | 93% | 36.0 min | 12% |
+| 230 | rknn, acq on A55 | 316 | 191 | 93% | 32.2 min | 32% |
+| 260 | FFTW | 337 | 211 | 95% | 36.9 min | 72% |
+| 260 | rknn | 347 | 237 | 94% | 37.6 min | 19% |
+| 260 | rknn, acq on A55 | 327 | 209 | 93% | 33.4 min | 18% |
+
+(rknn: `-acc rknn`; acq on A55: `-cpu_acq 0-3 -cpu_trk 0-7`, the tracking on
+all cores. These runs used the matmul API for the assisted searches, see
+13.2.)
+
+- The all-in-view set without L6 (172 signals, 3 frequencies x 5
+  constellations incl. pilots) is tracked in real time by all
+  configurations while 227 other signals are searched continuously; the
+  limit is ~200 channels (CPU 90-95%).
+- At N=200 the NPU with the acquisition on the A55 keeps 186 channels locked
+  in real time vs 167 by FFTW (+11%). The difference is the acquisition
+  throughput under load: with the CPU saturated the FFTW search slows down
+  and the assisted searches of the long codes (B1CP 7, E1C 3, L1CP 2, L2CM,
+  found by the NPU at 176-193 s in the second search cycle) are not reached
+  within 300 s; the IF buffer usage of FFTW goes up to 46-72% (NPU 12-32%).
+- Without the core assignment the host steps of the NPU search compete with
+  the tracking on the A76 (N=200: 312 s, behind real time); with the
+  acquisition on the A55 the receiver stays in real time.
+- The NPU saves only 0.4-0.7 core at the same load: the receiver searches one
+  signal at a time, so the CPU acquisition uses at most ~1 core of 8, and the
+  tracking (~0.05 core per channel) is the limit of the capacity.
+
+### 13.10 Direct acquisition of long codes
+
+`test/acc/long_sigs.sh` (11 GPS PRNs, L1CP 10 ms: M=320000, 201 bins; L2CM
+20 ms: M=640000, 401 bins), single core, time / CPU time per signal, same
+detections for all (5 detected, max diff C/N0 0.1 dB, code 0, Doppler 0.006
+bin):
+
+| backend | L1CP A76 | L2CM A76 | L1CP A55 | L2CM A55 |
+|---|---|---|---|---|
+| FFTW (wisdom) | 5.46 s / 5.44 s | 11.2 s / 11.2 s | 25.7 s / 25.7 s | 55.2 s / 55.1 s |
+| rknn (`_f`, chunks 23 / 20 bins) | **2.97 s / 0.27 s** | **5.72 s / 0.65 s** | **3.31 s / 0.69 s** | **6.54 s / 1.54 s** |
+| rknn:mm | 2.17 s / 1.44 s | 5.98 s / 2.98 s | 6.91 s / 6.15 s | 15.8 s / 12.7 s |
+
+The NPU is 1.8-2.0x faster than FFTW on the A76 with 1/17-1/20 of the CPU
+time, and 7.8-8.4x faster on the A55 with 1/36 of the CPU time (almost the
+same search time as from the A76). The large FFTs are slow on the RK3588 CPU
+(L1CP 5.5 s on the A76 vs 0.61 s on an Intel P-core, section 8.0).
+
+### 13.11 Pull-in failures (SIGNAL LOST)
+
+The NPU runs had more SIGNAL LOST (18-37 vs 21-24 per run). All LOSTs are
+signals of the tracked set (no false alarm of the background), ~2 s after
+the acquisition (pull-in failure), at C/N0 < 38 dB-Hz at the acquisition.
+With the same IF data and start time (bench_sdr_trk, 66 weak signals, 14
+start times, acquisition by cpu or rknn) the failures are the same (48 vs 49
+of 807), so the NPU acquisition has the same quality; the receiver with the
+NPU re-acquires the weak signals more often (faster search cycle). The
+failures are mostly the 10.23 / 5.115 Mcps signals of the L5 band (E5aI 62%,
+E5aQ 58%, B2aD 45%, L5I 33%, E6 24-31%; <= 2.046 Mcps: 0-2%), weak data
+components found by the assisted acquisition; a wider E-L spacing (0.5, 1.0
+chip) does not reduce them (bench: 10-12%), so they are a property of the
+tracking loops, not of the 16 MHz sampling (the signal power of BPSK(10) in
++/-8 MHz is 89.4% vs 90.6% in +/-12 MHz). The 24 MHz sampling is still
+needed for the code tracking accuracy of the wideband signals.
+
+### 13.12 Raspberry Pi 5 (CPU only)
+
+Cortex-A76 x4 2.4 GHz, 8 GB, Ubuntu 24.04, same code and data (USB3 SSD):
+
+| | Pi 5 | ROCK 5B A76 |
+|---|---|---|
+| L1CA search PocketFFT / FFTW | 396 / 246 ms | 437 / 252 ms |
+| E1B search PocketFFT / FFTW | 3329 / 2053 ms | 2094 / 1394 ms |
+| correlator cpu (1 core), 16 / 64 / 256 ch | 20.2 / 20.7 / 26.8 us | 21.2 / 22.4 / 29.0 us |
+| correlator cpu_mt:4, 16 / 64 / 256 ch | 6.2 / 5.8 / 6.9 us | 6.0 / 5.6 / 7.4 us |
+
+Same A76 performance except the large FFT (128000 points: 1.5x slower, 2 MB
+L3 and narrower memory bus). The ROCK 5B adds the 4 A55 and the NPU. The E2E
+capacity runs on the Pi 5 stopped (the board shut down under the full load
+with a 5V 3A supply and the USB SSD; a 5V 5A supply is needed).
+
+### 13.13 Shared DFT on the NPU (shift mode)
+
+With the bins spaced by fs / M, the correlation of bin k is
+|IDFT(X[m+k] C[m])| = |IDFT(X[m] C[m-k])|, where X is the DFT of the IF
+samples wiped by the carrier of the first bin of the chunk. The model `_s`
+computes the forward DFT (F_A, twiddle, Transpose, F_B) once, replicates it for
+the bins and multiplies it by the code DFT rolled by k bins (an input written
+by the host when the code changes, 16-byte copies in the native layout from
+rows extended by the wrapped element), followed by the same IDFT as `_f`. The
+replication by `Tile` (bins along W) or by a broadcast `Mul` (bins in the
+batch) gave wrong results on the RK3588 NPU (NRMSE 0.83-0.90 for all bins,
+checked with RKNN-Toolkit-Lite2 on the board) although correct in the
+RKNN-Toolkit2 simulator (1.4e-3); with `Concat` of Kc copies the NPU result
+is correct (1.4e-3, same as `_f`).
+
+`quick_acq.sh` (30 signals, PASS, same as `_f`), time / CPU time per search:
+
+| | L1CA A76 | E1B A76 | L1CA A55 | E1B A55 |
+|---|---|---|---|---|
+| `_f` | 168 / 32 ms | 914 / 165 ms | 232 / 103 ms | 1145 / 423 ms |
+| `_s` (default) | **119 / 29 ms** | **576 / 148 ms** | **177 / 97 ms** | **811 / 392 ms** |
+
+Long codes (A76, 2 PRNs): L1CP 3.36 -> 1.83 s, L2CM 6.42 -> 3.72 s per
+search (FFTW 5.46 / 11.2 s). The model sizes are also smaller (no folded
+weights per bin, e.g. E1B 128000:27 7.3 MB).
+
+### 13.14 Live-like capacity, CPU profile and decimation
+
+CPU profile (`perf record -a`, 30 s, N=200 of 13.9): `rknn` with the
+acquisition on the A55: the tracking correlator 74% of all CPU time
+(`mix_carr_p` carrier mixing by LUT 42%, `dot_IQ_code_acc` 32%), IF input
+thread 4.4%, libc 7.7%, kernel 8.6%, the NPU plugin 1.2% (~0.1 core);
+FFTW: `libfftw3f` 7.4% (~0.6 core) plus the host steps of the CPU search.
+With the Kc = 1 models of the assisted searches (13.2) the capacity did not
+change (N=200: 183 vs 186 channels), so the NPU path costs ~0.1 core and the
+capacity is set by the tracking correlators.
+
+Live-like input: with the file input the IF input thread waits when the CPU
+is saturated and the whole receiver falls behind (13.9). With
+`pocket_trk -rcv_prio 10` (SCHED_RR, `setcap cap_sys_nice+ep`) the input
+stays in real time like a live front-end, and an overload shows as the
+IF buffer usage > 100% (the channels lag behind the buffer, data lost). The
+capacity is then the largest N without overflow. Decimation (`-dec
+1:2,2:2,3:2,4:2,5:2`: the RF CHs of L1/E1/B1C, B1I, G1, L2C, G2 at 8 MHz by
+the 9-tap LPF and 2:1 decimation, tracking and search at 8 MHz; L5/E5/E6 at
+16 MHz; 8 MHz models 16000:7:63, 16000:1:63, 64000:27, 64000:1, 160000:1 and
+FFTW wisdom of the same sizes; C/N0 of the decimated signals -0.5 dB):
+
+| N | configuration | LOCK at end (time to reach) | max BUFF | CPU | user CPU |
+|---|---|---|---|---|---|
+| 200 | rknn, acq on A55 | 184 | 85% | 97% | 31.5 min |
+| 200 | FFTW | 170 | 52% | 93% | 32.5 min |
+| 230 | rknn, acq on A55 | 182 | 125% (overflow) | 100% | 32.5 min |
+| 230 | FFTW | 190 | 188% (overflow) | 101% | 33.2 min |
+| 200 | rknn, acq on A55, decimation | 191 | 7% | 84% | 29.5 min |
+| 200 | FFTW, decimation | 193 | 16% | 88% | 32.1 min |
+| 230 | rknn, acq on A55, decimation | **217** (181 s) | 10% | 91% | 31.6 min |
+| 230 | FFTW, decimation | 214 (242 s) | 25% | 92% | 33.5 min |
+| 260 | rknn, acq on A55, decimation | 230 (max 238) | 119% (overflow) | 99% | 32.6 min |
+| 260 | FFTW, decimation | 214 (search cycle not completed in 300 s) | 26% | 94% | 34.0 min |
+
+(rknn: shared DFT models `_s`; all with `-rcv_prio 10`; single runs.)
+
+- Without decimation the real-time limit is ~185 channels (N=200: NPU 184
+  locked at BUFF 85%, FFTW 170; N=230: both overflow).
+- The decimation of the narrowband RF CHs raises it to ~217-230 channels
+  (+17-24%) with the same CPU, independent of the NPU.
+- The NPU reaches the locked set earlier (N=230: 217 at 181 s vs 214 at 242
+  s by FFTW), uses ~0.5 core less at the same load, and near the limit keeps
+  acquiring up to the tracking capacity (N=260: 230-238, then overflow),
+  while the FFTW search does not complete the cycle of 487 channels in 300 s.
+
+### 13.15 Findings
 
 - On RK3588 the NPU acquisition (default `_f`) is 1.5x faster than FFTW on
   the A76 and 4.8-5.0x on the A55 with 1/8-1/14 of the CPU time (INT8: 2.1-2.4x
-  on the A76, an option because of the saturation by interference). The model-level optimizations (carrier folding, batch-1 layout,
-  3 real Conv) reduced the NPU time by 38% (L1CA) / 22% (E1B); the remaining
-  NPU time is Conv, Transposes and the element-wise twiddle/code products.
+  on the A76, an option because of the saturation by interference); for the
+  direct search of the long codes 2x (A76) and 8x (A55) with 1/17-1/36 of
+  the CPU time. The model-level optimizations (carrier folding, batch-1
+  layout, 3 real Conv) reduced the NPU time by 38% (L1CA) / 22% (E1B); the
+  remaining NPU time is Conv, Transposes and the element-wise twiddle/code
+  products.
+- In the receiver the NPU halves the search cycle of all signals and, with
+  the acquisition on the A55, keeps more channels locked in real time near
+  the CPU limit (N=200: 186 vs 167 with FFTW), because its search does not
+  slow down when the CPU is saturated. The CPU saving at the same load is
+  small (0.4-0.7 core), since the CPU search is serial (~1 core).
+- ROCK 5B tracks the all-in-view set without L6 (172 signals) in real time
+  with continuous search of 227 other signals; with a live-like input the
+  limit is ~185 channels, ~217-230 with the decimation of the narrowband RF
+  CHs to 8 MHz (13.14). The capacity is set by the tracking correlators
+  (74% of the CPU); the NPU acquisition costs ~0.1 core (FFTW ~0.6 core).
 - The host CPU cost of the NPU path is the I/O in the native layout; FP32 or
   NHWC inputs cost more CPU than the FFT itself.
 - The matmul API (no precompiled model) is the fastest wall time on the A76
   but uses as much CPU as the FFT (host element-wise steps, memory bound).
-- Open: DFT sharing (shift mode) on RKNN (~0.6x time, section 4), PRN
-  batching to use the idle NPU (one search at a time), all-in-view end-to-end
-  evaluation with longer data, ROCK 5C.
+- The shared DFT (`_s`, default) reduces the NPU search time to 0.55-0.76x of
+  `_f` (13.13): vs FFTW on the A76 1.4x (L1CA) / 2.4x (E1B) / 3x (long codes)
+  faster.
+- Open: 24 MHz data and a live Pocket SDR FE, ROCK 5C.
