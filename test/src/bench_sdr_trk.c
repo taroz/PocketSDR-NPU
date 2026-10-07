@@ -3,8 +3,8 @@
 //
 //  usage: bench_sdr_trk [-fmt RAW32|INT8X2] [-f fs_MHz] [-fo f1,f2,...]
 //             [-toff s] [-tlen s] [-acc backend] [-tacc backend] [-batch]
-//             [-nposx n] [-o out_file] -sig sig -prn prns -rfch ch
-//             [-sig ...] file
+//             [-nposx n] [-sp_corr chip] [-o out_file] -sig sig -prn prns
+//             -rfch ch [-sig ...] file
 //
 //  The signals are acquired by the receiver channel state machine
 //  (sdr_ch_update() in SDR_STATE_SRCH) and tracked over the same IF samples
@@ -14,7 +14,8 @@
 //  tracking correlator separated (sdr_ch_update_pre(), sdr_acc_corr_batch()
 //  by the tracking backend -tacc, sdr_ch_update_post()). The tracking states
 //  and the correlator outputs of each epoch are written to out_file for the
-//  regression (cmp_trk.py).
+//  regression (cmp_trk.py). -sp_corr sets the E-L correlator spacing (chip)
+//  (receiver option sp_corr).
 //
 #include <sys/resource.h>
 #include <time.h>
@@ -156,6 +157,9 @@ int main(int argc, char **argv)
             batch = 1;
         } else if (!strcmp(argv[i], "-nposx") && i + 1 < argc) {
             nposx = atoi(argv[++i]);
+        } else if (!strcmp(argv[i], "-sp_corr") && i + 1 < argc) {
+            extern double sdr_sp_corr;
+            sdr_sp_corr = atof(argv[++i]);
         } else if (!strcmp(argv[i], "-o") && i + 1 < argc) {
             out = argv[++i];
         } else if (!strcmp(argv[i], "-sig") && i + 1 < argc && nsig < MAX_SIG) {
