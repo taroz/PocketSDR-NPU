@@ -23,7 +23,7 @@ BENCH=../utest/bench_sdr_acq
 BENCH_FFTW=../utest/bench_sdr_acq_fftw
 WISDOM=${WISDOM:-$OUT/fftw_wisdom.txt}
 export SDR_ACC_PATH=${SDR_ACC_PATH:-$SCRIPT_DIR/../../lib/linux}
-source ./${SIGFILE:-acq_sigs.sh}
+source "${SIGFILE:-acq_sigs.sh}"
 REF=${REF:-golden_cpu.txt}
 
 mkdir -p "$OUT"

@@ -18,6 +18,8 @@
                             // (CPU reference has carrier LUT quantization)
 #define TOL_CN0  0.3        // tolerance of C/N0 metric (dB)
 #define TOL_FP16 0.005      // tolerance of NRMSE of FP16 backend vs FP32 backend
+#define TOL_INT8 0.2        // tolerance of NRMSE of INT8 backend (rknn:int8,
+                            // strong signal: about 0.13)
 
 typedef struct {            // test data
     int N, M, len_fds, ncall;
@@ -106,6 +108,13 @@ static double nrmse(const test_data_t *d, const float *P0, const float *P1)
     return sqrt(e / s);
 }
 
+// tolerance of NRMSE of powers of backend ------------------------------------
+static double tol_nrmse(const char *name)
+{
+    return !strncmp(name, "rknn", 4) && strstr(name, "int8") ? TOL_INT8 :
+        TOL_NRMSE;
+}
+
 // compare backend results with CPU reference (return powers) ------------------
 static float *check_backend(const test_data_t *d, const float *P_ref,
     const char *name)
@@ -118,7 +127,7 @@ static float *check_backend(const test_data_t *d, const float *P_ref,
     printf("[%s nrmse=%.4f cn0=%.2f/%.2f] ", name, e, cn0_ref, cn0);
     TEST_ASSERT_EQ_INT(ix0[0], ix1[0]);
     TEST_ASSERT_EQ_INT(ix0[1], ix1[1]);
-    TEST_ASSERT_TRUE(e < TOL_NRMSE);
+    TEST_ASSERT_TRUE(e < tol_nrmse(name));
     TEST_ASSERT_NEAR(cn0_ref, cn0, TOL_CN0);
     TEST_ASSERT_NEAR(sdr_fine_dop(P_ref, d->M, d->fds, d->len_fds, ix0),
         sdr_fine_dop(P, d->M, d->fds, d->len_fds, ix1), 0.05 * 0.5 / d->T);

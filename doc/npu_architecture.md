@@ -1,6 +1,6 @@
 # NPU Acceleration Architecture (Development Note)
 
-Date: 2026-10-02
+Date: 2026-10-02 (section 13: 2026-10-07)
 
 ----
 
@@ -189,6 +189,18 @@ cd test/utest && make test bench_sdr_acq bench_sdr_acq_fftw
 cd test/acc && ./bench_acq.sh [IF_file [out_dir [backend ...]]]
 # on low-power cores (e.g. LP E-cores of Core Ultra)
 TASKSET="taskset -c 12" ./bench_acq.sh "" out_lp
+```
+
+Rockchip RK3588 (section 13):
+
+```sh
+# models (PC with RKNN-Toolkit2 of the same version as the runtime)
+cd lib/build && python3 gen_rknn_acq.py -f 32000:7 128000:27   # default (_f)
+python3 gen_rknn_acq.py -w 32000:7 128000:27   # fallback (_w), bins not spaced by fs/M
+python3 gen_rknn_acq.py -q 32000:7 128000:27   # INT8 (_fq, option int8)
+# plugin (on the SBC, RKNN runtime in /usr or $RKNN_DIR)
+cd lib/build && make USE_SOAPY=0 USE_RKNN=1 && make install USE_RKNN=1
+cd test/acc && TASKSET="taskset -c 4" ./quick_acq.sh "" out rknn
 ```
 
 Tracking (Phase 2):
@@ -401,16 +413,29 @@ per-frequency-bin scale of the products folded into the IDFT matrix (weights).
   operation.
 - The non-coherent integration is accumulated on the host per call.
   Accumulation on the NPU needs a sync point in `search_sig()` (not done).
-- Only the Intel NPU via OpenVINO is implemented. Static shapes; the first
-  compilation of a model takes ~0.5 s (cached afterwards).
+- Intel NPU via OpenVINO and Rockchip NPU via RKNN (section 13) are
+  implemented. Static shapes; the first compilation of an OpenVINO model takes
+  ~0.5 s (cached afterwards). The RKNN models are precompiled per shape on a
+  PC (RKNN-Toolkit2); shapes without a model use the RKNN matmul API.
 - The CPU usage of the NPU backend includes the busy polling of the NPU
   driver while waiting for the completion.
-- Tracking (Phase 2): the NPU tracking backend is functional and verified
+- Rockchip RK3588 (section 13):
+
+```sh
+# models (PC with RKNN-Toolkit2 of the same version as the runtime)
+cd lib/build && python3 gen_rknn_acq.py -f 32000:7 128000:27   # default (_f)
+python3 gen_rknn_acq.py -w 32000:7 128000:27   # fallback (_w), bins not spaced by fs/M
+python3 gen_rknn_acq.py -q 32000:7 128000:27   # INT8 (_fq, option int8)
+# plugin (on the SBC, RKNN runtime in /usr or $RKNN_DIR)
+cd lib/build && make USE_SOAPY=0 USE_RKNN=1 && make install USE_RKNN=1
+cd test/acc && TASKSET="taskset -c 4" ./quick_acq.sh "" out rknn
+```
+
+Tracking (Phase 2): the NPU tracking backend is functional and verified
   but slower than the CPU on this platform (section 11), so `pocket_trk -tacc
   npu` cannot run in real time. Batched correlators exclude L6D/L6E and E5ABQ.
-- The measurements were done on an x86 laptop SoC; the LP E-cores are used as
-  a proxy of a low-power CPU. The target ARM SBCs need their own backends and
-  measurements.
+- Sections 7-12 were measured on an x86 laptop SoC (the LP E-cores as a
+  proxy of a low-power CPU); section 13 on RK3588 (ROCK 5B).
 
 ## 10. Supported NPU Backends (Acquisition and Tracking)
 
@@ -418,7 +443,8 @@ per-frequency-bin scale of the products folded into the IDFT matrix (weights).
 |---------|--------|--------|--------|
 | Intel NPU (Core Ultra, NPU 5) | `libsdr_acc_ov.so` (OpenVINO 2026.4) | `NPU` | implemented, verified |
 | OpenVINO CPU (FP32, reference of the graph) | `libsdr_acc_ov.so` | `CPU` | implemented (test only) |
-| Rockchip RK3588, AMD XDNA, Apple ANE, Qualcomm Hexagon | - | - | future (same plugin interface, own low-level implementation) |
+| Rockchip RK3588 NPU (acquisition) | `libsdr_acc_rknn.so` (RKNN runtime 2.3.0, models by RKNN-Toolkit2 2.3.0) | `rknn` | implemented, verified (section 13) |
+| AMD XDNA, Apple ANE, Qualcomm Hexagon | - | - | future (same plugin interface, own low-level implementation) |
 
 Setup of the Intel NPU (Linux): the NPU device `/dev/accel/accel0` must be
 accessible by the user (group `render` or ACL). OpenVINO is installed from the
@@ -598,3 +624,293 @@ PRNs per inference).
   an LP core) and the direct search of long codes (section 8.0).
 - No NPU-specific method to reduce the per-channel tracking cost was found
   (correlator: section 11, FIR: 12.1, Conv/Sin/Cos/DFT ops: section 8).
+
+## 13. Rockchip RK3588 (ROCK 5B)
+
+### 13.1 Platform and measurement conditions
+
+- Radxa ROCK 5B (RK3588: 4x Cortex-A76 2.3 GHz + 4x Cortex-A55 1.8 GHz,
+  NPU 3 cores, 8 GB LPDDR4x), heatsink without fan, Radxa Debian 12, kernel
+  6.1, RKNPU driver 0.9.8, RKNN runtime (librknnrt) 2.3.0. Desktop stopped
+  (multi-user.target). Built natively with `-mcpu=native` (NEON).
+- CPU governor `performance`, and the devfreq governors of the DDR (`dmc`)
+  and the NPU set to `performance`. With the default `dmc_ondemand`, the DDR
+  stays at 528 MHz (max 2112 MHz) and the memory-bound steps vary by 2x (e.g.
+  E1B FFTW search 1614 ms vs 1394 ms with `performance`). All results below
+  are with `performance` (not persistent):
+
+```sh
+echo performance | sudo tee /sys/devices/system/cpu/cpufreq/policy*/scaling_governor
+echo performance | sudo tee /sys/class/devfreq/dmc/governor
+echo performance | sudo tee /sys/class/devfreq/fdab0000.npu/governor
+```
+
+- Single-core results are pinned by `taskset` (A76: core 4, A55: core 0). The
+  temperature stayed below 69 C (SoC) and the clocks never dropped.
+- Recorded IF data: first 10 s of the data set of section 5 (the SBC has the
+  first 640 MB only).
+
+### 13.2 Plugin (libsdr_acc_rknn.so)
+
+`src/sdr_acc_rknn.cpp`, built by `lib/build/libsdr_acc_rknn.mk` (`make
+USE_RKNN=1`), selected by `-acc rknn[:opt]`. The Doppler bins of a call are
+split into chunks for the 3 NPU cores; each chunk is processed by a worker
+thread with its own RKNN context bound to one NPU core (the multi-core mode
+of one context, `RKNN_NPU_CORE_0_1_2`, is not faster: 19.1 -> 17.3 ms for 21
+bins, while 3 contexts in parallel take 9.6 ms). Two implementations:
+
+1. **RKNN model** (default): the whole code search of a chunk is one
+   inference of a model precompiled by RKNN-Toolkit2 on a PC
+   (`lib/build/gen_rknn_acq.py`, models `lib/linux/rknn/acq_M<M>_K<Kc>_R<R><kind>.rknn`,
+   searched in `$SDR_ACC_RKNN_MODEL` or `<plugin dir>/rknn`). Same algorithm
+   as the CPU reference (carrier wipe-off and DFT for each bin, no shared
+   DFT). Model kinds (searched in this order):
+   - `_fq` (option `int8`): INT8 of `_f` (section 13.5).
+   - `_f` (default, `gen_rknn_acq.py -f`): carrier folded into the DFT
+     (section 13.3). Input: IF samples wiped by the carrier of the first bin
+     of the chunk (host), the code DFT replicated along W. Needs bins spaced
+     by fs / M (PocketSDR: 0.5 / T); otherwise `_w` is used.
+   - `_w` (`-w`, option `nofold`): carrier wipe-off in the model (inputs: IF
+     samples shared by the bins and the separable carrier a[n1], b[n2] of each
+     bin).
+   - no suffix (option `hostwipe`): carrier wipe-off by the host (NEON FP16).
+2. **matmul API** (option `mm`, and fallback if no model file): the 4 DFT
+   stages are `rknn_matmul` calls (FP16 x FP16 -> FP16, "data x DFT matrix",
+   bins stacked along the rows), and the element-wise steps (carrier,
+   twiddle + transpose, code product, power) are done by the host with NEON
+   between the calls. Works for any shape without a model, but the host steps
+   are bound by the memory traffic (5 passes over Kc x M complex values).
+
+Model graph (ONNX, opset 13, FP16 on the NPU): the RKNN compiler maps a MatMul
+to a 1x1 Conv over the channels and inserts Transposes around each MatMul
+(first prototype: 6 Transposes = 57% of 12.2 ms). The graph is therefore
+written in the NCHW layout of the NPU: each DFT stage is a 1x1 Conv over the
+channels (complex: 4 real Conv + Add/Sub, no channel split/concat), and the
+axis change between the stages is 2 Transposes (n1 -> n2 and k2 -> k1; the
+forward F_B output k2 is already the channel axis of the IDFT F_B^-1):
+
+```text
+xr, xi [Kc][n1][1][n2]  -> Conv F_A -> twiddle -> Transpose -> Conv F_B
+  -> * code [1][k2][1][k1] -> Conv F_B^-1 -> twiddle -> Transpose
+  -> Conv F_A^-1 (R rows) -> P [Kc][p1][1][p2] = |c[B*p1+p2]|^2 / 64
+```
+
+- I/O by zero-copy in the native layout of the NPU (NC1HWC2, C2 = 8, FP16,
+  `RKNN_QUERY_NATIVE_INPUT_ATTR`, `pass_through`), written/read by the host
+  directly: host CPU per inference 0.19 ms. Inputs with one channel (the
+  carrier b[n2], native NHWC) are passed in the normal FP16 NHWC layout (the
+  native NHWC with a padded W stride gave wrong results). With
+  `rknn_inputs_set()` (FP32
+  NCHW) the conversion takes 4.2 ms of CPU, with zero-copy FP16 NHWC 5.2 ms
+  (inside `rknn_run()`).
+- NPU time of one inference (1 core, L1CA M=32000 Kc=7 / E1B M=128000 Kc=27):
+  host wipe-off model 6.3 / 115 ms, model with wipe-off 7.9 / 137 ms.
+  Breakdown (L1CA): Transpose 37%, Conv 32%, Mul 20%, Add/Sub 10%. The n2
+  axis as H instead of W is slower (12.2 ms).
+- The output power is scaled by 1/64 in the model to stay in the FP16 range
+  (|c|^2 up to M for unit-RMS input).
+- RKNN matmul API: FP16 400 GFLOPS per NPU core with an explicit core mask
+  (190 GFLOPS with the default auto mode), ~0.1 ms per call. The native
+  layout conversion of B (`rknn_B_normal_layout_to_native_layout()`) does not
+  support the FP16 output type (converted with the FP32 output type, same B
+  layout).
+
+### 13.3 NPU-internal optimization of the model
+
+NPU time per inference (L1CA M=32000 Kc=7 / E1B M=128000 Kc=27, FP16, 1 NPU
+core and 3 cores in parallel = all bins of a call):
+
+| model | L1CA 1 core | L1CA 3 cores (21 bins) | E1B 1 core | E1B 3 cores (81 bins) |
+|-------|-------------|------------------------|------------|-----------------------|
+| `_w`: wipe-off in the model (previous default) | 7.9 | 11.7 | 137 | 200 |
+| + carrier folded into F_A weights and twiddles | 6.1 | 9.2 | 112 | 162 |
+| + bins in channels/width (batch 1) | 5.0 | 7.2 | (W > 8192: CPU fallback) | (Kc=14 x 2: 159) |
+| + complex Conv by 3 real Conv (= `_f`) | **4.9** | **7.2** | **105** | **156** |
+| `_fq`: INT8 (F_A^-1 and power in FP16) | 3.5 | 5.0 | 65 | 95 |
+
+- Profile of `_w` (L1CA): Mul 32%, Transpose 30%, Conv 26%, Add/Sub 13%. The
+  element-wise ops (33 per inference, 0.1-0.18 ms each) are bound by the DDR
+  bandwidth of the NPU; the broadcast Muls of the carrier wipe-off (12 ops)
+  were the most expensive.
+- **Carrier folding**: the PocketSDR Doppler bins are spaced by the DFT bin
+  fs / M, so carr_k[n] = carr_0[n] W_M^(k n) and with n = B n1 + n2,
+  W_M^(k n) = W_A^(k n1) W_M^(k n2). The factor W_A^(k n1) is folded into the
+  F_A weights of bin k (rows rotated by k; the Kc bins are the output channels
+  of one Conv on the shared input) and W_M^(k n2) into a per-bin twiddle
+  constant. The host only wipes the IF samples with the carrier of the first
+  bin of the chunk (M samples). Each bin still has its full DFT on the NPU
+  (same MACs, no shared DFT); the 12 element-wise ops of the wipe-off are
+  removed.
+- **Batch 1**: a Transpose of [7,160,1,200] takes 0.64 ms, of the same data as
+  [1,1120,1,200] 0.37 ms. Keeping the bins in the channels/width ([1][(k,k1)][1][n2]
+  -> [1][n2][1][(k,k1)]) halves the Transpose time; the reshape to [Kc,A,1,B]
+  before the last stage is free for A % 8 = 0. The width is limited to 8192
+  (larger: CPU fallback), so E1B (Kc x A = 8640) keeps the bins in the batch.
+- **3 real Conv** (Wr(Xr+Xi), (Wr+Wi)Xi, (Wi-Wr)Xr): -3% (L1CA) / -6% (E1B).
+- Tried and rejected: prime-factor DFT (no twiddles, M = 125 x 256): slower
+  (7.8 ms, channel count 125 not aligned, Reshape and Transposes 4.9 ms);
+  grouped Conv for the last stage instead of the reshape (5.5 ms); bins in
+  H x W for the last stage (5.7 ms); n2 in H instead of W (12.2 ms).
+
+### 13.4 Acquisition results
+
+Time per signal search (T_ACQ = 20 ms) / CPU time per search (ms), 30
+signals of `quick_acq.sh` (all PASS vs golden), single core:
+
+| backend | L1CA A76 | E1B A76 | L1CA A55 | E1B A55 |
+|---------|----------|---------|----------|---------|
+| cpu (PocketFFT) | 437 / 437 | 2094 / 2078 | 1713 / 1713 | 9466 / 9450 |
+| fftw+cpu (FFTW PATIENT) | 252 / 252 | 1394 / 1378 | 1119 / 1119 | 5541 / 5525 |
+| rknn:mm (matmul API) | 163 / 159 | 736 / 601 | 533 / 528 | 2372 / 2272 |
+| rknn:hostwipe (model) | 218 / 42 | 977 / 195 | 320 / 185 | 1415 / 665 |
+| rknn:nofold (model `_w`) | 257 / 31 | 1098 / 120 | 334 / 116 | 1398 / 470 |
+| **rknn (model `_f`, default)** | **167 / 31** | **914 / 161** | **231 / 102** | **1114 / 394** |
+| rknn:int8 (model `_fq`) | 121 / 29 | 584 / 137 | 191 / 113 | 943 / 500 |
+
+With all 4 A55 cores (`taskset -c 0-3`): rknn 203 / 1019 ms, rknn:int8 171 /
+731 ms, rknn:mm 262 / 1202 ms (L1CA / E1B). (rknn rows: with the prefetch of
+the output accumulation below; before: A76 166 / 916, A55 244 / 1266 (CPU 116
+/ 542), A55 x4 207 / 1057 ms; rknn:int8 and other rows: before.)
+
+- Full regression (309 signals, A76, default model `_f`): PASS, same
+  detection for all signals, max diff C/N0 0.3 dB, code 0 sample, fine Doppler
+  0.041 bin, peak 3.7% (same as the FP32/OpenVINO results of section 8.1);
+  157 ms / CPU 18-21 ms per 1 ms-code search, 821-824 ms / CPU 59-67 ms per 4
+  ms-code search. (`_w`: also PASS, 250 / 1050 ms.)
+- Versus FFTW on the same core (default `_f`): A76 1.5x (L1CA) / 1.5x (E1B)
+  faster with 1/8-1/9 of the CPU time; A55 4.6x / 4.4x faster with 1/10 of the
+  CPU time. On the A55 the host steps (output accumulation into P, 0.65 ms per
+  chunk and call) are now a large part of the search time. The accumulation
+  (FP16 output in the native layout -> transpose -> P += scale * out, 8 rows
+  of P at a time) stalls the in-order A55 at the cache misses of the
+  read-modify-write of P (E1B: 6.9 MB of P per chunk > L3 3 MB, 0.9 GB/s).
+  A software prefetch of the next cache line of each P row and of the output
+  halves it on the A55 (E1B 18.9 -> 9.1 ms per chunk and call, 1.9 GB/s;
+  next line: best, 2-16 lines ahead: 9.7-14.9 ms, slower with the distance)
+  and does not change the A76 (2.6 -> 2.8 ms). The NPU search time is almost independent of the CPU core,
+  so the NPU makes the acquisition on the low-power A55 cores as fast as on
+  the A76.
+- Per call (one non-coherent step, all bins, random data, A76): default model
+  `_f` 7.6 ms / CPU 0.79 ms (L1CA, 21 bins), 161 ms / CPU 8.6 ms (E1B, 81
+  bins); `_fq` (INT8) 5.0 / 0.82 ms, 90 / 8.8 ms; `_w` 12.3 ms / CPU 0.93 ms,
+  207 ms / CPU 9.8 ms;
+  host wipe-off model 10.4 / 1.58 ms, 180 / 21.6 ms; matmul API 7.0 / 6.6 ms,
+  122 / 94 ms. The remaining CPU of the default model is mainly the
+  accumulation of the output powers into P (E1B 2.4 ms per chunk, memory
+  bound).
+- `test_sdr_acc` (`SDR_ACC_TEST=rknn,rknn:hostwipe,rknn:mm`): all modes
+  within the tolerances (NRMSE 0.0146 vs the CPU reference, carrier LUT of the
+  reference).
+
+### 13.5 INT8
+
+First attempt (model `_w`, whole model quantized by RKNN-Toolkit2 w8a8 with
+random calibration data): NPU 6.3 -> 3.9 ms, but NRMSE of the powers 8-11%
+(the toolkit re-quantizes the output of every op, ~10 quantization points),
+also with the IDFT in FP16; `w16a16i` is not faster than FP16.
+
+Model `_fq` (`gen_rknn_acq.py -q`, option `int8`), INT8 of the folded model
+`_f` with:
+
+- hybrid quantization: the last IDFT stage F_A^-1 and the correlation power
+  in FP16 (an INT8 power output quantizes the noise floor to a few levels and
+  the peaks of strong signals were clipped: L5I C/N0 45.9 dB-Hz -12% peak),
+- calibration data of synthetic signals of the real codes of the shape (64
+  samples, codes of the period M / 2 / fs, e.g. L1CA, B1I, G1CA, L5I, E5aI,
+  E6B for 1 ms; E1B, L6D for 4 ms; C/N0 30-60 dB-Hz, 1/4 noise only, random
+  code offset and Doppler), IF samples at unit RMS,
+- code DFT normalized by its max magnitude (|code| <= 1, section 8.1), the
+  scale restored to the output; INT8 inputs written by the host in the native
+  layout (C2 = 16).
+
+Results: NPU time -29% (L1CA) / -38% (E1B) vs `_f` (table of 13.3); search
+time A76 121 / 584 ms (FFTW 252 / 1394). 30 signals: PASS (max diff C/N0 0.3
+dB, code 1 sample, peak 3.1%). 309 signals: same detection for all signals,
+1 error: L6D PRN 199 (C/N0 36.7) has two CSK peaks of almost equal power
+(1.13e-3 / 1.16e-3) and the INT8 noise selects the other one (code phase
++407 samples). With only the power in FP16: 4 errors (C/N0 of undetected
+noise maxima 0.6 dB, L5I peak 6%, the L6D peak). `test_sdr_acc`: NRMSE 0.048
+(weak signal, PASS) and 0.127 (strong signal C/N0 55.7, tolerance 0.05 of the
+FP backends, C/N0 diff 0.15 dB; `test_sdr_acc` uses the tolerance 0.2 for
+`rknn:int8`).
+
+Interference (synthetic L1CA, fs 4 MHz, 10 ms, AGC to the total RMS and
+4-bit IF, interference at Doppler +0 / 250 / 1234.5 Hz; J/N = interference
+power / noise power):
+
+| interference | CPU C/N0 | `_fq` (INT8) C/N0, NRMSE | `_f` (FP16) C/N0, NRMSE |
+|---|---|---|---|
+| none | 50.2 | 50.2, 0.048 | 50.2, 0.015 |
+| CW J/N 10 dB | 35.0-37.0 | 47.5-48.1 (+11-13 dB), 0.95 | -0.02-+0.06 dB, 0.04 |
+| CW J/N 20-50 dB (not detected) | 32.0-34.3 | 36.0-41.5 (+3.5-9.5 dB, false peaks), 0.97 | -0.7-0 dB, 0.04 |
+| pulsed CW (duty 10 %) J/N 10-20 dB | 36.7-45.0 | +2.7-6.0 dB, 0.51-0.77 | -0.06-+0.04 dB, 0.02 |
+
+A narrowband (CW) or pulsed interference concentrates the energy into a few
+elements after the DFT stages and the fixed INT8 scales calibrated with the
+interference-free signals saturate: the noise floor is suppressed and the
+C/N0 metric is overestimated (false detections above the threshold 34 dB-Hz).
+A uniform gain change (AGC) is cancelled by the unit RMS normalization. A
+calibration including the interference would need ~sqrt(A) larger scales
+(3 bits for A = 80) and lose the accuracy without interference. INT8 is
+therefore an option (`rknn:int8`), not the default.
+
+### 13.6 Tracking (CPU)
+
+The NPU tracking backend is not implemented for RKNN (the correlation is a
+batched GEMV bound by the memory traffic, section 11.4). Batched correlators
+on the CPU (`bench_sdr_corr`, L1CA 16 MHz, us per channel and epoch, 16 / 64
+/ 256 channels):
+
+| backend (cores) | 4 taps | 21 taps |
+|-----------------|--------|---------|
+| cpu (1 A76) | 21.2 / 22.4 / 29.0 | 66.4 / 88.9 / 92.0 |
+| cpu_mt:4 (4 A76) | 6.0 / 5.6 / 7.4 | 15.2 / 26.7 / 28.3 |
+| cpu_mt:8 (4 A76 + 4 A55) | 8.0 / 5.1 / 6.5 | 17.8 / 26.0 / 14.5 |
+| cpu (1 A55) | 96.6 / 98.1 / 108 | 258 / 302 / 297 |
+| cpu_mt:4 (4 A55) | 27.0 / 25.3 / 26.0 | 65.8 / 74.4 / 73.2 |
+
+Channels in real time (1 ms batch, 4 taps): 1 A76 ~45, 4 A76 ~170, 8 cores
+~150-190, 4 A55 ~38. `quick_trk.sh` (33 channels L1CA/E1B/B1I, 1 s): `cpu`
+and `cpu_mt` bit-identical to the original channel update on all core sets.
+
+### 13.7 End-to-end receiver (pocket_trk, 10 s, 10 signal types, 309 channels, 8 cores)
+
+| `-acc` / `-tacc` | wall (s) | user CPU (s) | sys (s) | SIGNAL FOUND / LOST |
+|------------------|----------|--------------|---------|---------------------|
+| cpu / - | 11.7 | 14.8 | 1.4 | 7 / 1 |
+| rknn / - | 11.8 | 8.2 | 1.9 | 9 / 1 |
+| cpu / cpu_mt | 11.8 | 14.8 | 1.9 | 7 / 0 |
+| rknn / cpu_mt | 12.7 | 8.8 | 2.6 | 8 / 1 |
+
+The receiver searches one channel at a time (`update_srch_ch()`), so within
+10 s only L1CA was searched; the CPU time of the acquisition is reduced by
+~6.6 s per 10 s (0.66 core). A longer data set is needed for the all-in-view
+evaluation.
+
+Core assignment (`pocket_trk -cpu_acq cpus -cpu_trk cpus`, `sdr_thread_affinity()`):
+the threads of the `-acc` / `-tacc` backends inherit the CPU affinity of the
+caller of `sdr_acc_init()` / `sdr_acc_trk_init()`; the channel threads switch
+between the two CPU sets by the channel state (search: `-cpu_acq`, lock:
+`-cpu_trk`), the batched correlator group threads and the IF input thread run
+on `-cpu_trk`, and `cpu_mt` without `:n` uses as many threads as the CPUs of
+the affinity. `rknn / cpu_mt` with `-cpu_acq 0-3 -cpu_trk 4-7` (A55 + NPU for
+the acquisition, A76 for the tracking): 312 threads on 0-3 and 14 on 4-7,
+same signals found (9), batched tracking 0.96 -> 0.50 s per 10 s (cpu_mt:4
+on the A76 instead of cpu_mt:8 on all cores), acquisition 13.9 -> 13.0 ms per
+call (NPU bound, not slower on the A55). Without `-tacc` the locked channel
+threads move to 4-7.
+
+### 13.8 Findings
+
+- On RK3588 the NPU acquisition (default `_f`) is 1.5x faster than FFTW on
+  the A76 and 4.8-5.0x on the A55 with 1/8-1/14 of the CPU time (INT8: 2.1-2.4x
+  on the A76, an option because of the saturation by interference). The model-level optimizations (carrier folding, batch-1 layout,
+  3 real Conv) reduced the NPU time by 38% (L1CA) / 22% (E1B); the remaining
+  NPU time is Conv, Transposes and the element-wise twiddle/code products.
+- The host CPU cost of the NPU path is the I/O in the native layout; FP32 or
+  NHWC inputs cost more CPU than the FFT itself.
+- The matmul API (no precompiled model) is the fastest wall time on the A76
+  but uses as much CPU as the FFT (host element-wise steps, memory bound).
+- Open: DFT sharing (shift mode) on RKNN (~0.6x time, section 4), PRN
+  batching to use the idle NPU (one search at a time), all-in-view end-to-end
+  evaluation with longer data, ROCK 5C.

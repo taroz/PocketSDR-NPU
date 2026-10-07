@@ -10,6 +10,8 @@
 #  (cmp_trk.py). The scaling of the batched correlators by channels and taps
 #  is measured by bench_sdr_corr.
 #  Set TASKSET (e.g. "taskset -c 12-15") to run on specific CPU cores.
+#  Set TLEN (tracking time (s), default 3), TRK_SIGS (signal options) and
+#  SCALING=0 (skip bench_sdr_corr) for a quick run, e.g. quick_trk.sh.
 #
 SCRIPT_DIR=$(cd "$(dirname "$0")" && pwd)
 cd "$SCRIPT_DIR" || exit 1
@@ -19,8 +21,8 @@ shift 2 2>/dev/null
 BACKENDS=${@:-cpu cpu_mt npu}
 BENCH=../utest/bench_sdr_trk
 export SDR_ACC_PATH=${SDR_ACC_PATH:-$SCRIPT_DIR/../../lib/linux}
-ARGS="-f 16 -fo 1575.42,1561,1602,1227.6,1246,1176.45,1207.14,1273 -tlen 3 \
--sig L1CA -prn 1-32 -rfch 1 -sig E1B -prn 1-36 -rfch 1 -sig B1I -prn 1-63 -rfch 2"
+ARGS="-f 16 -fo 1575.42,1561,1602,1227.6,1246,1176.45,1207.14,1273 -tlen ${TLEN:-3} \
+${TRK_SIGS:--sig L1CA -prn 1-32 -rfch 1 -sig E1B -prn 1-36 -rfch 1 -sig B1I -prn 1-63 -rfch 2}"
 
 mkdir -p "$OUT"
 make -C ../utest bench_sdr_trk bench_sdr_corr > /dev/null || exit 1
@@ -33,6 +35,7 @@ for be in $BACKENDS; do
         grep '^#'
     python3 cmp_trk.py "$OUT/trk_ref.txt" "$OUT/trk_$name.txt"
 done
+[ "$SCALING" = 0 ] && exit 0
 echo "=== scaling (channels x taps)"
 BL=$(echo $BACKENDS | tr ' ' ',')
 $TASKSET ../utest/bench_sdr_corr -nch 16,32,64,128,256,512 -ntap 4 -tacc $BL 2>&1 |
