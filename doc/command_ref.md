@@ -313,7 +313,7 @@ pocket_trk [-sig sig -prn prn[,...] [-rfch ch[,...]] ...]
            [-driver name] [-gain gain] [-bw bw] [-fd dopp]
            [-log path] [-nmea path] [-rtcm path] [-raw path] ...
            [-arch nch] [-geom file] [-acc backend] [-tacc backend]
-           [-cpu_acq cpus] [-cpu_trk cpus]
+           [-cpu_acq cpus] [-cpu_trk cpus] [-rcv_prio prio] [-dec rfch:D[,...]]
            [-h height] [-opt file] [-debug file] [-v] [file]
 ```
 
@@ -394,6 +394,17 @@ The input can be a local file, a TCP stream, a Pocket SDR FE device, or a SoapyS
     batched correlator group threads, the threads of the `-tacc` backend
     (`cpu_mt` without `:n`: as many threads as the CPU cores) and the IF data
     input thread. [all CPUs]
+- `-rcv_prio prio`
+  - Real-time priority (SCHED_RR, 1-99) of the IF data input thread, which
+    reads and unpacks the IF data, switches the search channel and updates
+    the PVT every cycle, to keep it from waiting for the CPU under a high
+    tracking load (Linux, needs root or CAP_SYS_NICE/rtprio). [not changed]
+- `-dec rfch:D[,...]`
+  - Decimate the IF data of the RF CH(s) (IQ sampling) by D (2 or 4) after a
+    digital LPF (cutoff 0.9 x fs/(2D)) for the search and tracking of the
+    signals of the RF CH at fs/D. For the RF CHs of narrowband signals only
+    (e.g. L1CA, B1I, G1CA, L2CM; the tracking cost per channel is roughly
+    proportional to the sampling rate). [none]
 - `-h height`
   - Console height (rows) for the runtime status display. [`64`]
 - `-opt file`

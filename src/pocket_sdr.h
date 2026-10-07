@@ -430,6 +430,9 @@ typedef struct sdr_rcv_tag {    // SDR receiver type
     int fast_acq;               // fast acquisition flag (0:off, 1:on)
     char cpu_acq[64];           // CPUs of acquisition (option -CPU_ACQ)
     char cpu_trk[64];           // CPUs of tracking (option -CPU_TRK)
+    int rcv_prio;               // real-time priority of IF input thread (0:off)
+    int dec[SDR_MAX_RFCH];      // decimation factor of RF CH (option -DEC, 0,1: off)
+    sdr_buff_t *buffd[SDR_MAX_RFCH]; // decimated IF data buffers (NULL: off)
     int ngrp;                   // number of batched correlator groups
     void *grp[SDR_MAX_NCH];     // batched correlator groups
     sdr_thread_t thread;        // SDR receiver thread

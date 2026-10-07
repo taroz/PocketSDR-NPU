@@ -27,6 +27,9 @@
 //  2026-08-08  1.13 report an output stream open error as stream status error
 //  2026-10-03  1.14 add batched tracking correlator groups (option trk_batch)
 //  2026-10-08  1.15 add CPU affinity options -CPU_ACQ, -CPU_TRK
+//                   fix 1 ms sleep per read of stream input
+//                   add option -RCV_PRIO
+//                   add option -DEC (decimation of RF CH for tracking)
 //
 #include "pocket_sdr.h"
 
@@ -540,15 +543,28 @@ static void ch_th_udpvt(sdr_ch_th_t *th)
     sdr_pvt_udobs(th->rcv->pvt, th->ix, ch);
 }
 
+// IF data buffer and samples per cycle of SDR receiver CH ---------------------
+static const sdr_buff_t *ch_buff(const sdr_rcv_t *rcv, const sdr_ch_t *ch)
+{
+    int k = ch->rf_ch;
+    return k < SDR_MAX_RFCH && rcv->buffd[k] ? rcv->buffd[k] : rcv->buff[k];
+}
+static int ch_ncyc(const sdr_rcv_t *rcv, const sdr_ch_t *ch)
+{
+    int k = ch->rf_ch;
+    return k < SDR_MAX_RFCH && rcv->buffd[k] ? rcv->N / rcv->dec[k] : rcv->N;
+}
+
 // update SDR receiver CH for an epoch -----------------------------------------
 static void ch_th_update(sdr_ch_th_t *th)
 {
     sdr_ch_t *ch = th->ch;
+    int nc = ch_ncyc(th->rcv, ch);
     
-    sdr_ch_update(ch, th->ix * SDR_CYC, th->rcv->buff[ch->rf_ch],
-        th->rcv->N * (int)(th->ix % MAX_BUFF));
+    sdr_ch_update(ch, th->ix * SDR_CYC, ch_buff(th->rcv, ch),
+        nc * (int)(th->ix % MAX_BUFF));
     ch_th_udpvt(th);
-    th->ix += ch->N / th->rcv->N;
+    th->ix += ch->N / nc;
 }
 
 // set CPU affinity of SDR receiver CH thread by CH state ---------------------
@@ -570,7 +586,7 @@ static void *ch_thread(void *arg)
 {
     sdr_ch_th_t *th = (sdr_ch_th_t *)arg;
     sdr_ch_t *ch = th->ch;
-    int n = ch->N / th->rcv->N;
+    int n = ch->N / ch_ncyc(th->rcv, ch);
     
     while (th->state) {
         int64_t ix = get_buff_ix(th->rcv);
@@ -615,8 +631,8 @@ static void *grp_thread(void *arg)
     while (g->state) {
         int64_t ix = get_buff_ix(rcv);
         for ( ; g->ix + 2 * g->n <= ix && g->state; g->ix += g->n) {
-            const sdr_buff_t *buff = rcv->buff[g->rf_ch];
-            int njob = 0, ib = rcv->N * (int)(g->ix % MAX_BUFF);
+            const sdr_buff_t *buff = ch_buff(rcv, g->th[0]->ch);
+            int njob = 0, ib = ch_ncyc(rcv, g->th[0]->ch) * (int)(g->ix % MAX_BUFF);
             
             for (int i = 0; i < g->nth; i++) {
                 sdr_ch_th_t *th = g->th[i];
@@ -660,7 +676,7 @@ static void grp_th_start(sdr_rcv_t *rcv)
     rcv->ngrp = 0;
     for (int i = 0; i < rcv->nch; i++) {
         sdr_ch_th_t *th = rcv->th[i];
-        int n = th->ch->N / rcv->N, j;
+        int n = th->ch->N / ch_ncyc(rcv, th->ch), j;
         for (j = 0; j < rcv->ngrp; j++) {
             grp_th_t *g = (grp_th_t *)rcv->grp[j];
             if (g->rf_ch == th->ch->rf_ch && g->n == n) break;
@@ -814,6 +830,11 @@ static void set_srch_ch(sdr_rcv_t *rcv, const char *opt)
 //                     -ARCH=<nch>: number of array channels
 //                     -CPU_ACQ=<cpus>: CPUs of acquisition (e.g. 0-3)
 //                     -CPU_TRK=<cpus>: CPUs of tracking (e.g. 4-7)
+//                     -RCV_PRIO=<prio>: real-time priority (SCHED_RR) of IF
+//                         input thread (1-99, 0: not changed)
+//                     -DEC=<rfch>:<D>[,<rfch>:<D>...]: decimate the IF data of
+//                         RF CH by D (2,4) with LPF for the CHs of the RF CH
+//                         (search and tracking at fs/D, narrowband signals)
 //
 //  returns:
 //      SDR receiver (NULL: error)
@@ -839,6 +860,7 @@ sdr_rcv_t *sdr_rcv_new(const char **sigs, const int *prns, int n, int fmt,
     rcv->fast_acq = strstr(opt, "-FAST_SRCH") ? 1 : 0;
     if ((p = strstr(opt, "-CPU_ACQ="))) sscanf(p, "-CPU_ACQ=%63s", rcv->cpu_acq);
     if ((p = strstr(opt, "-CPU_TRK="))) sscanf(p, "-CPU_TRK=%63s", rcv->cpu_trk);
+    if ((p = strstr(opt, "-RCV_PRIO="))) sscanf(p, "-RCV_PRIO=%d", &rcv->rcv_prio);
     rcv->fmt = fmt;
     rcv->fs = fs;
     rcv->nrfch = num_rfch(fmt);
@@ -852,6 +874,19 @@ sdr_rcv_t *sdr_rcv_new(const char **sigs, const int *prns, int n, int fmt,
             fmt == SDR_FMT_CS8) ? 8 : (fmt == SDR_FMT_CS16 ? 16 : bits[i]);
     }
     rcv->N = (int)(SDR_CYC * fs);
+    if ((p = strstr(opt, "-DEC="))) { // decimation of RF CHs
+        int ch, d, k = 0;
+        p += 5;
+        while (sscanf(p, "%d:%d%n", &ch, &d, &k) >= 2) {
+            if (ch >= 1 && ch <= rcv->nrfch && (d == 2 || d == 4) &&
+                rcv->N % d == 0 && rcv->rfch[ch-1].IQ == 2) {
+                rcv->dec[ch-1] = d;
+            }
+            p += k;
+            if (*p != ',') break;
+            p++;
+        }
+    }
     
     for (int i = 0; i < n && rcv->nch < SDR_MAX_NCH; i++) {
         int ch[SDR_MAX_RFCH] = {0};
@@ -862,7 +897,8 @@ sdr_rcv_t *sdr_rcv_new(const char **sigs, const int *prns, int n, int fmt,
             if (rtoc_of(rcv, ch[j])) fi[j] -= fs * 0.25; // fs/4 shift
         }
         for (int j = 0; j < nch && rcv->nch < SDR_MAX_NCH; j++) {
-            sdr_ch_th_t *th = ch_th_new(sigs[i], prns[i], fi[j], fs, rcv);
+            int d = ch[j] < rcv->nrfch && rcv->dec[ch[j]] > 1 ? rcv->dec[ch[j]] : 1;
+            sdr_ch_th_t *th = ch_th_new(sigs[i], prns[i], fi[j], fs / d, rcv);
             if (th) {
                 th->ch->no = rcv->nch + 1;
                 th->ch->rf_ch = ch[j];
@@ -879,6 +915,13 @@ sdr_rcv_t *sdr_rcv_new(const char **sigs, const int *prns, int n, int fmt,
     
     for (int i = 0; i < nrfch; i++) {
         rcv->buff[i] = sdr_buff_new(rcv->N * MAX_BUFF, 2); // IQ
+    }
+    for (int i = 0; i < rcv->nrfch; i++) { // decimated buffers and LPFs
+        if (rcv->dec[i] <= 1) continue;
+        rcv->buffd[i] = sdr_buff_new(rcv->N / rcv->dec[i] * MAX_BUFF, 2);
+        if (!rcv->rfch[i].lpf) { // cutoff 0.9 x new Nyquist
+            rcv->rfch[i].lpf = sdr_lpf_new(0.45 * fs / rcv->dec[i], fs);
+        }
     }
     rcv->ich = -1;
     snprintf(rcv->opt, sizeof(rcv->opt), "%s", opt);
@@ -916,6 +959,9 @@ void sdr_rcv_free(sdr_rcv_t *rcv)
         sdr_buff_free(rcv->buff[i]);
     }
     for (int i = 0; i < SDR_MAX_RFCH; i++) {
+        sdr_buff_free(rcv->buffd[i]);
+    }
+    for (int i = 0; i < SDR_MAX_RFCH; i++) {
         sdr_lpf_free(rcv->rfch[i].lpf);
     }
     for (int m = 0; m < SDR_MAX_ARCH; m++) {
@@ -947,9 +993,10 @@ static int read_data(sdr_rcv_t *rcv, uint8_t *raw, int N)
         if (n < 0) return 0;
     } else { // SDR_DEV_STR
         for (int n = 0; n < N; ) {
-            n += strread((stream_t *)rcv->dp, raw + n, N - n);
+            int m = strread((stream_t *)rcv->dp, raw + n, N - n);
             if (!rcv->state) return 0;
-            sdr_sleep_msec(1);
+            if (m <= 0) sdr_sleep_msec(1); // wait only if no data
+            n += m;
         }
     }
     return N;
@@ -1104,6 +1151,12 @@ static void write_buff(sdr_rcv_t *rcv, const uint8_t *raw, int64_t ix)
     for (int k = 0; k < nch_lpf; k++) {
         if (rcv->rfch[k].lpf) {
             sdr_lpf_apply(rcv->rfch[k].lpf, rcv->buff[k]->data + base, rcv->N);
+        }
+        if (k < SDR_MAX_RFCH && rcv->buffd[k]) { // decimate (after LPF)
+            int d = rcv->dec[k], nd = rcv->N / d;
+            const sdr_cpx8_t *src = rcv->buff[k]->data + base;
+            sdr_cpx8_t *dst = rcv->buffd[k]->data + nd * (int)(ix % MAX_BUFF);
+            for (int j = 0; j < nd; j++) dst[j] = src[j * d];
         }
     }
     // combine RF CH IF data into array CH IF data (multi-CH RAW formats)
@@ -1453,6 +1506,16 @@ static void *rcv_thread(void *arg)
     uint8_t *raw = (uint8_t *)sdr_malloc(ns * rcv->N);
     
     if (*rcv->cpu_trk) sdr_thread_affinity(rcv->cpu_trk);
+#ifndef WIN32
+    // set thread scheduling real-time (log only - async stderr breaks display)
+    if (rcv->rcv_prio > 0) {
+        struct sched_param param = {rcv->rcv_prio};
+        if (pthread_setschedparam(pthread_self(), SCHED_RR, &param)) {
+            sdr_log(2, "$LOG,%.3f,%s,%d,set IF input thread scheduling error",
+                0.0, "", 0);
+        }
+    }
+#endif
     if (rcv->dev == SDR_DEV_USB) {
         sdr_dev_start((sdr_dev_t *)rcv->dp);
     } else if (rcv->dev == SDR_DEV_SOAPY) {

@@ -31,6 +31,7 @@
 //  2026-10-02  1.14 add -acc option for accelerator backend
 //  2026-10-03  1.15 add -tacc option for batched tracking correlator backend
 //  2026-10-08  1.16 add -cpu_acq and -cpu_trk options for CPU affinity
+//                   add -rcv_prio and -dec options
 //
 #include <math.h>
 #include <signal.h>
@@ -60,7 +61,8 @@ static const char *usage_text[] = {
     "       [-driver name] [-gain gain] [-bw bw] [-fd dopp]",
     "       [-log path] [-nmea path] [-rtcm path] [-raw path] ... [-opt file]",
     "       [-arch nch] [-geom file] [-acc backend] [-tacc backend]",
-    "       [-cpu_acq cpus] [-cpu_trk cpus] [file]",
+    "       [-cpu_acq cpus] [-cpu_trk cpus] [-rcv_prio prio]",
+    "       [-dec rfch:D[,...]] [file]",
     NULL
 };
 
@@ -239,6 +241,8 @@ int main(int argc, char **argv)
     char rfch_opt[1024] = "-RFCH";
     const char *geom_file = "";
     const char *acc = "cpu", *tacc = "", *cpu_acq = "", *cpu_trk = "";
+    int rcv_prio = 0;
+    const char *dec = "";
 
     for (int i = 1; i < argc; i++) {
         if (!strcmp(argv[i], "-sig") && i + 1 < argc) {
@@ -326,6 +330,10 @@ int main(int argc, char **argv)
             cpu_acq = argv[++i];
         } else if (!strcmp(argv[i], "-cpu_trk") && i + 1 < argc) {
             cpu_trk = argv[++i];
+        } else if (!strcmp(argv[i], "-rcv_prio") && i + 1 < argc) {
+            rcv_prio = atoi(argv[++i]);
+        } else if (!strcmp(argv[i], "-dec") && i + 1 < argc) {
+            dec = argv[++i];
         } else if (!strcmp(argv[i], "-v")) {
             print_ver();
         } else if (argv[i][0] == '-') {
@@ -373,6 +381,14 @@ int main(int argc, char **argv)
     if (*cpu_trk) {
         size_t len = strlen(rfch_opt);
         snprintf(rfch_opt + len, sizeof(rfch_opt) - len, " -CPU_TRK=%s", cpu_trk);
+    }
+    if (rcv_prio > 0) {
+        size_t len = strlen(rfch_opt);
+        snprintf(rfch_opt + len, sizeof(rfch_opt) - len, " -RCV_PRIO=%d", rcv_prio);
+    }
+    if (*dec) {
+        size_t len = strlen(rfch_opt);
+        snprintf(rfch_opt + len, sizeof(rfch_opt) - len, " -DEC=%s", dec);
     }
     
     signal(SIGTERM, sig_func);
