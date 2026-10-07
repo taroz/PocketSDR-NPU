@@ -59,6 +59,7 @@ extern "C" {
 #define SDR_SIZE_UBUFF (1<<20)  // size of USB buffer (bytes)
 #define SDR_MAX_NPRN   256      // max number of PRNs
 #define SDR_MAX_NCH    1500     // max number of receiver channels
+#define SDR_CPU_ALL    "0-63"   // CPU list of all CPUs (sdr_thread_affinity())
 #define SDR_MAX_NSYM   2000     // max number of symbols
 #define SDR_MAX_DATA   4096     // max length of navigation data
 #define SDR_N_CORRX    101      // number of additional correlators
@@ -319,6 +320,7 @@ typedef struct {                // SDR receiver channel thread type
     struct sdr_rcv_tag *rcv;    // pointer to SDR receiver
     sdr_thread_t thread;        // SDR receiver channel thread
     int batch;                  // tracked by batched correlator group (0/1)
+    int cpu;                    // CPU affinity set (0:none,1:acq,2:trk)
     sdr_mutex_t mtx;            // lock of channel update (batched correlator)
 } sdr_ch_th_t;
 
@@ -426,6 +428,8 @@ typedef struct sdr_rcv_tag {    // SDR receiver type
     double tscale;              // time scale to replay IF data file
     char opt[1024];             // receiver options
     int fast_acq;               // fast acquisition flag (0:off, 1:on)
+    char cpu_acq[64];           // CPUs of acquisition (option -CPU_ACQ)
+    char cpu_trk[64];           // CPUs of tracking (option -CPU_TRK)
     int ngrp;                   // number of batched correlator groups
     void *grp[SDR_MAX_NCH];     // batched correlator groups
     sdr_thread_t thread;        // SDR receiver thread
@@ -444,6 +448,7 @@ const char *sdr_get_name(void);
 const char *sdr_get_ver(void);
 int sdr_thread_create(sdr_thread_t *thread, void *(func)(void *), void *arg);
 void sdr_thread_join(sdr_thread_t thread);
+int sdr_thread_affinity(const char *cpus);
 void sdr_mutex_init(sdr_mutex_t *mtx);
 void sdr_mutex_lock(sdr_mutex_t *mtx);
 void sdr_mutex_unlock(sdr_mutex_t *mtx);

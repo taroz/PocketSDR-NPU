@@ -15,7 +15,8 @@
 //
 //    backend   description
 //    cpu       CPU reference (sdr_corr_std() for each job) (default)
-//    cpu_mt[:n] CPU multi-threaded (n threads, default: number of CPU cores)
+//    cpu_mt[:n] CPU multi-threaded (n threads, default: number of CPU cores of
+//              the thread affinity of the caller)
 //    npu       NPU by plugin ov (OpenVINO) on device NPU (= ov:NPU)
 //    <p>[:opt] plugin libsdr_acc_<p>.so (.dll) with option string opt
 //
@@ -25,7 +26,11 @@
 //  History:
 //  2026-10-02  1.0  new
 //  2026-10-03  1.1  add tracking correlator backends (batched correlator)
+//  2026-10-08  1.2  cpu_mt: default threads = CPUs of the thread affinity
 //
+#if !defined(WIN32) && !defined(_GNU_SOURCE)
+#define _GNU_SOURCE         // sched_getaffinity()
+#endif
 #include <math.h>
 #include "pocket_sdr.h"
 #include "sdr_acc.h"
@@ -34,6 +39,7 @@
 #else
 #include <dlfcn.h>
 #include <unistd.h>
+#include <sched.h>
 #endif
 
 #define ACC_YIELD_BINS 22   // Doppler bins to release CPU (as sdr_search_code_cpu())
@@ -536,6 +542,10 @@ static int num_cores(void)
     GetSystemInfo(&si);
     return (int)si.dwNumberOfProcessors;
 #else
+#if defined(__linux__)
+    cpu_set_t set;
+    if (sched_getaffinity(0, sizeof(set), &set) == 0) return CPU_COUNT(&set);
+#endif
     long n = sysconf(_SC_NPROCESSORS_ONLN);
     return n > 0 ? (int)n : 1;
 #endif

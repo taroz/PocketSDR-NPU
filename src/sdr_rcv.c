@@ -26,6 +26,7 @@
 //                   add API sdr_rcv_write_str()
 //  2026-08-08  1.13 report an output stream open error as stream status error
 //  2026-10-03  1.14 add batched tracking correlator groups (option trk_batch)
+//  2026-10-08  1.15 add CPU affinity options -CPU_ACQ, -CPU_TRK
 //
 #include "pocket_sdr.h"
 
@@ -550,6 +551,18 @@ static void ch_th_update(sdr_ch_th_t *th)
     th->ix += ch->N / th->rcv->N;
 }
 
+// set CPU affinity of SDR receiver CH thread by CH state ---------------------
+//   (search: CPUs of acquisition, lock: CPUs of tracking)
+static void ch_th_cpu(sdr_ch_th_t *th)
+{
+    int cpu = th->ch->state == SDR_STATE_LOCK ? 2 : 1;
+    const char *cpus = cpu == 1 ? th->rcv->cpu_acq : th->rcv->cpu_trk;
+    
+    if (th->cpu == cpu || (!*th->rcv->cpu_acq && !*th->rcv->cpu_trk)) return;
+    sdr_thread_affinity(*cpus ? cpus : SDR_CPU_ALL);
+    th->cpu = cpu;
+}
+
 // SDR receiver CH thread ------------------------------------------------------
 //   (the tracking epochs of the channels in a batched correlator group are
 //   updated by the group thread)
@@ -567,6 +580,7 @@ static void *ch_thread(void *arg)
                 sdr_mutex_unlock(&th->mtx);
                 break;
             }
+            ch_th_cpu(th);
             ch_th_update(th);
             sdr_mutex_unlock(&th->mtx);
         }
@@ -597,6 +611,7 @@ static void *grp_thread(void *arg)
     sdr_rcv_t *rcv = g->rcv;
     sdr_ch_th_t *ths[SDR_MAX_NCH];
     
+    if (*rcv->cpu_trk) sdr_thread_affinity(rcv->cpu_trk);
     while (g->state) {
         int64_t ix = get_buff_ix(rcv);
         for ( ; g->ix + 2 * g->n <= ix && g->state; g->ix += g->n) {
@@ -797,6 +812,8 @@ static void set_srch_ch(sdr_rcv_t *rcv, const char *opt)
 //      bits      (I)  number of bits for each RFCH
 //      opt       (I)  receiver options
 //                     -ARCH=<nch>: number of array channels
+//                     -CPU_ACQ=<cpus>: CPUs of acquisition (e.g. 0-3)
+//                     -CPU_TRK=<cpus>: CPUs of tracking (e.g. 4-7)
 //
 //  returns:
 //      SDR receiver (NULL: error)
@@ -820,6 +837,8 @@ sdr_rcv_t *sdr_rcv_new(const char **sigs, const int *prns, int n, int fmt,
         sscanf(p, "-BUMP_K=%lf", &sdr_bump_k);
     }
     rcv->fast_acq = strstr(opt, "-FAST_SRCH") ? 1 : 0;
+    if ((p = strstr(opt, "-CPU_ACQ="))) sscanf(p, "-CPU_ACQ=%63s", rcv->cpu_acq);
+    if ((p = strstr(opt, "-CPU_TRK="))) sscanf(p, "-CPU_TRK=%63s", rcv->cpu_trk);
     rcv->fmt = fmt;
     rcv->fs = fs;
     rcv->nrfch = num_rfch(fmt);
@@ -1433,6 +1452,7 @@ static void *rcv_thread(void *arg)
     uint32_t tick = sdr_get_tick(), tick_r = tick;
     uint8_t *raw = (uint8_t *)sdr_malloc(ns * rcv->N);
     
+    if (*rcv->cpu_trk) sdr_thread_affinity(rcv->cpu_trk);
     if (rcv->dev == SDR_DEV_USB) {
         sdr_dev_start((sdr_dev_t *)rcv->dp);
     } else if (rcv->dev == SDR_DEV_SOAPY) {

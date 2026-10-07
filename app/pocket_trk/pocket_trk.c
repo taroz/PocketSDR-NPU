@@ -30,6 +30,7 @@
 //  2026-08-07  1.13 close the SDR device on console close for Windows
 //  2026-10-02  1.14 add -acc option for accelerator backend
 //  2026-10-03  1.15 add -tacc option for batched tracking correlator backend
+//  2026-10-08  1.16 add -cpu_acq and -cpu_trk options for CPU affinity
 //
 #include <math.h>
 #include <signal.h>
@@ -58,7 +59,8 @@ static const char *usage_text[] = {
     "       [-toff toff] [-ti tint] [-p bus,[,port] [-c conf_file]",
     "       [-driver name] [-gain gain] [-bw bw] [-fd dopp]",
     "       [-log path] [-nmea path] [-rtcm path] [-raw path] ... [-opt file]",
-    "       [-arch nch] [-geom file] [-acc backend] [-tacc backend] [file]",
+    "       [-arch nch] [-geom file] [-acc backend] [-tacc backend]",
+    "       [-cpu_acq cpus] [-cpu_trk cpus] [file]",
     NULL
 };
 
@@ -236,7 +238,7 @@ int main(int argc, char **argv)
     double gain = 0.0, bw = 0.0, max_dop = 0.0;
     char rfch_opt[1024] = "-RFCH";
     const char *geom_file = "";
-    const char *acc = "cpu", *tacc = "";
+    const char *acc = "cpu", *tacc = "", *cpu_acq = "", *cpu_trk = "";
 
     for (int i = 1; i < argc; i++) {
         if (!strcmp(argv[i], "-sig") && i + 1 < argc) {
@@ -320,6 +322,10 @@ int main(int argc, char **argv)
             acc = argv[++i];
         } else if (!strcmp(argv[i], "-tacc") && i + 1 < argc) {
             tacc = argv[++i];
+        } else if (!strcmp(argv[i], "-cpu_acq") && i + 1 < argc) {
+            cpu_acq = argv[++i];
+        } else if (!strcmp(argv[i], "-cpu_trk") && i + 1 < argc) {
+            cpu_trk = argv[++i];
         } else if (!strcmp(argv[i], "-v")) {
             print_ver();
         } else if (argv[i][0] == '-') {
@@ -339,8 +345,18 @@ int main(int argc, char **argv)
         sdr_rcv_setopt("max_dop", max_dop);
     }
     sdr_func_init(fftw_wisdom);
+    // the threads of the backends inherit the CPU affinity of the caller
+    if (*cpu_acq && !sdr_thread_affinity(cpu_acq)) {
+        fprintf(stderr, "CPU affinity error: %s\n", cpu_acq);
+        return -1;
+    }
     if (!sdr_acc_init(acc)) {
         fprintf(stderr, "accelerator backend error: %s\n", acc);
+        return -1;
+    }
+    if ((*cpu_acq || *cpu_trk) &&
+        !sdr_thread_affinity(*cpu_trk ? cpu_trk : SDR_CPU_ALL)) {
+        fprintf(stderr, "CPU affinity error: %s\n", cpu_trk);
         return -1;
     }
     if (*tacc) { // batched tracking correlators
@@ -349,6 +365,14 @@ int main(int argc, char **argv)
             return -1;
         }
         sdr_rcv_setopt("trk_batch", 1);
+    }
+    if (*cpu_acq) {
+        size_t len = strlen(rfch_opt);
+        snprintf(rfch_opt + len, sizeof(rfch_opt) - len, " -CPU_ACQ=%s", cpu_acq);
+    }
+    if (*cpu_trk) {
+        size_t len = strlen(rfch_opt);
+        snprintf(rfch_opt + len, sizeof(rfch_opt) - len, " -CPU_TRK=%s", cpu_trk);
     }
     
     signal(SIGTERM, sig_func);

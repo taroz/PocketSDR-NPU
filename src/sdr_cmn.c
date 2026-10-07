@@ -12,7 +12,11 @@
 //                   move API sdr_cpx_malloc(), sdr_cpx_free() to sdr_func.c
 //  2026-02-12  1.3  add API sdr_thread_create(), sdr_thread_join(),
 //                   sdr_mutex_init(), sdr_mutex_lock(), sdr_mutex_unlock()
+//  2026-10-08  1.4  add API sdr_thread_affinity()
 //
+#if !defined(WIN32) && !defined(_GNU_SOURCE)
+#define _GNU_SOURCE         // pthread_setaffinity_np()
+#endif
 #include "pocket_sdr.h"
 #ifdef WIN32
 #include <timeapi.h>
@@ -227,6 +231,55 @@ void sdr_thread_join(sdr_thread_t thread)
     CloseHandle(thread);
 #else
     (void)pthread_join(thread, NULL);
+#endif
+}
+
+//------------------------------------------------------------------------------
+//  Set CPU affinity of the calling thread. The threads created by the thread
+//  after the call inherit the affinity.
+//
+//  args:
+//      cpus     (I)  CPU list (e.g. "0-3", "4,6-7", SDR_CPU_ALL: all CPUs,
+//                    "": no change)
+//
+//  return:
+//      status (1:OK, 0:error or not supported)
+//
+int sdr_thread_affinity(const char *cpus)
+{
+    uint64_t mask = 0;
+    const char *p = cpus;
+    
+    if (!cpus || !*cpus) return 1;
+    while (*p) {
+        char *q;
+        long i = strtol(p, &q, 10), j = i;
+        if (q == p || i < 0 || i > 63) return 0;
+        if (*q == '-') {
+            p = q + 1;
+            j = strtol(p, &q, 10);
+            if (q == p || j < i || j > 63) return 0;
+        }
+        for ( ; i <= j; i++) mask |= (uint64_t)1 << i;
+        if (*q == ',') q++;
+        else if (*q) return 0;
+        p = q;
+    }
+#if defined(WIN32)
+    DWORD_PTR pmask, smask;
+    if (GetProcessAffinityMask(GetCurrentProcess(), &pmask, &smask)) {
+        mask &= (uint64_t)pmask; // (CPUs not in the process ignored)
+    }
+    return mask && SetThreadAffinityMask(GetCurrentThread(), (DWORD_PTR)mask);
+#elif defined(__linux__)
+    cpu_set_t set;
+    CPU_ZERO(&set);
+    for (int i = 0; i < 64; i++) {
+        if (mask & ((uint64_t)1 << i)) CPU_SET(i, &set);
+    }
+    return pthread_setaffinity_np(pthread_self(), sizeof(set), &set) == 0;
+#else
+    return 0;
 #endif
 }
 

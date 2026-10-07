@@ -313,6 +313,7 @@ pocket_trk [-sig sig -prn prn[,...] [-rfch ch[,...]] ...]
            [-driver name] [-gain gain] [-bw bw] [-fd dopp]
            [-log path] [-nmea path] [-rtcm path] [-raw path] ...
            [-arch nch] [-geom file] [-acc backend] [-tacc backend]
+           [-cpu_acq cpus] [-cpu_trk cpus]
            [-h height] [-opt file] [-debug file] [-v] [file]
 ```
 
@@ -382,6 +383,17 @@ The input can be a local file, a TCP stream, a Pocket SDR FE device, or a SoapyS
     Intel NPU) or `<plugin>[:<opt>]`. The tracking channels of the same RF
     channel and code period are correlated in a batch per epoch. See
     `doc/npu_architecture.md`. [none (channel threads)]
+- `-cpu_acq cpus`
+  - CPU cores (e.g. `0-3`, `0,2-3`) for the signal acquisition: the channel
+    threads in search state and the threads of the `-acc` backend (Linux and
+    Windows, up to 64 CPUs). E.g. `-cpu_acq 0-3 -cpu_trk 4-7` on RK3588 runs
+    the acquisition on the A55 cores (with the NPU) and the tracking on the
+    A76 cores. [all CPUs]
+- `-cpu_trk cpus`
+  - CPU cores for the tracking: the channel threads in tracking state, the
+    batched correlator group threads, the threads of the `-tacc` backend
+    (`cpu_mt` without `:n`: as many threads as the CPU cores) and the IF data
+    input thread. [all CPUs]
 - `-h height`
   - Console height (rows) for the runtime status display. [`64`]
 - `-opt file`
