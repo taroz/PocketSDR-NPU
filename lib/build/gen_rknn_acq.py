@@ -3,7 +3,7 @@
 #  generate RKNN models of parallel code search for Rockchip NPU plugin
 #  (libsdr_acc_rknn.so)
 #
-#  usage: gen_rknn_acq.py [-o dir] [-t target] [-w|-f|-q] [-fs fs] M:Kc[:R] ...
+#  usage: gen_rknn_acq.py [-o dir] [-t target] [-w|-f|-q|-s] [-fs fs] M:Kc[:R] ...
 #
 #    M  : DFT size (2 x samples per code period)
 #    Kc : Doppler bins per inference (= ceil(K / NPU cores), K: bins of search)
@@ -18,6 +18,11 @@
 #         replicated along W, Doppler bins spaced by fs / M) (model name:
 #         acq_M<M>_K<Kc>_R<R>_f.rknn)
 #
+#    -s : shared DFT (shift mode): inputs as -f, but the code DFT of bin k is
+#         rolled by k bins (cr, ci [1][k2][1][(k,k1)] if Kc * A <= MAX_W, else
+#         [Kc][k2][1][k1]); the forward DFT of the IF samples is computed once
+#         and shared by the bins (|IDFT(X[m+k] C[m])| = |IDFT(X[m] C[m-k])|)
+#         (model name: acq_M<M>_K<Kc>_R<R>_s.rknn)
 #    -q : INT8 model of -f (acq_M<M>_K<Kc>_R<R>_fq.rknn): all ops INT8 except
 #         the last IDFT stage F_A^-1 and the correlation power (FP16) (hybrid
 #         quantization), calibrated by synthetic signals (C/N0 30-60 dB-Hz) of the
@@ -64,7 +69,7 @@ MAX_W = 8192    # max width of NPU tensors (larger: CPU fallback)
 # factorize DFT size (same as sdr_acc_rknn.cpp) -------------------------------
 def factorize(M):
     for a in range(int(np.sqrt(M)), MIN_FACT - 1, -1):
-        if M % a == 0:
+        if M % a == 0 and (M // a) % 4 == 0: # B % 4 = 0 (as the plugin)
             return a, M // a
     return 0, 0
 
@@ -234,6 +239,102 @@ def build_onnx_fold(A, B, Kc, R):
     onnx.checker.check_model(m)
     return m
 
+# ONNX graph of shared DFT (shift mode, bins spaced by fs / M) ----------------
+def build_onnx_shift(A, B, Kc, R):
+    import onnx
+    from onnx import helper as h, TensorProto as T, numpy_helper as nh
+    M, W = A * B, Kc * A
+    flat = W <= MAX_W   # bins in width (batch 1)
+    nodes, inits, cnt = [], [], [0]
+    
+    def nm(p):
+        cnt[0] += 1
+        return '%s_%d' % (p, cnt[0])
+    
+    def const(v, dtype=np.float32):
+        name = nm('c')
+        inits.append(nh.from_array(np.asarray(v, dtype=dtype), name))
+        return name
+    
+    def op(t, ins, **kw):
+        o = nm(t)
+        nodes.append(h.make_node(t, ins, [o], **kw))
+        return o
+    
+    def dft(n, sgn, rows):  # w[k][n] (out, in) unitary
+        k = np.asarray(rows)[:, None] * np.arange(n)[None, :]
+        return np.exp(sgn * 2j * np.pi * (k % n) / n) / np.sqrt(n)
+    
+    def cconv(xr, xi, w):  # complex 1x1 Conv by 3 real Conv
+        c1 = op('Conv', [op('Add', [xr, xi]), const(w.real[:, :, None, None])])
+        yr = op('Add', [op('Conv', [xi, const(-(w.real + w.imag)[:, :, None, None])]), c1])
+        yi = op('Add', [op('Conv', [xr, const((w.imag - w.real)[:, :, None, None])]), c1])
+        return yr, yi
+    
+    def cmul(ar, ai, br, bi):
+        r = op('Sub', [op('Mul', [ar, br]), op('Mul', [ai, bi])])
+        i = op('Add', [op('Mul', [ar, bi]), op('Mul', [ai, br])])
+        return r, i
+    
+    def reshape(x, shape):
+        return op('Reshape', [x, const(shape, np.int64)])
+    
+    cs = [1, B, 1, W] if flat else [Kc, B, 1, A]
+    ins = [h.make_tensor_value_info(n, T.FLOAT, s) for n, s in
+        [('xr', [1, A, 1, B]), ('xi', [1, A, 1, B]), ('cr', cs), ('ci', cs)]]
+    k1 = np.arange(A)[:, None]
+    n2 = np.arange(B)[None, :]
+    t1 = np.exp(-2j * np.pi * ((k1 * n2) % M) / M)[None, :, None, :] # [1][k1][1][n2]
+    t2 = np.exp(2j * np.pi * ((n2.T * k1.T) % M) / M)              # [p2][k1]
+    perm = [0, 3, 2, 1]
+    
+    # forward DFT once (shared by the bins)
+    yr, yi = cconv('xr', 'xi', dft(A, -1, range(A)))    # [1][k1][1][n2]
+    yr, yi = cmul(yr, yi, const(t1.real), const(t1.imag))
+    zr, zi = op('Transpose', [yr], perm=perm), op('Transpose', [yi], perm=perm)
+    ur, ui = cconv(zr, zi, dft(B, -1, range(B)))        # [1][k2][1][k1]
+    # replicate for the bins by Concat (Tile and broadcast Mul gave wrong
+    # results on the RK3588 NPU, correct in the simulator)
+    ax = 3 if flat else 0
+    ur, ui = (op('Concat', [ur] * Kc, axis=ax), op('Concat', [ui] * Kc, axis=ax))
+    if flat:
+        t2 = np.tile(t2, (1, Kc))                       # [1][k2][1][(k,k1)]
+    vr, vi = cmul(ur, ui, 'cr', 'ci')                   # (or [Kc][k2][1][k1])
+    qr, qi = cconv(vr, vi, dft(B, 1, range(B)))         # [.][p2][1][.]
+    t2 = t2[None, :, None, :]
+    sr, si = cmul(qr, qi, const(t2.real), const(t2.imag))
+    sr, si = op('Transpose', [sr], perm=perm), op('Transpose', [si], perm=perm)
+    if flat:
+        sr, si = reshape(sr, [Kc, A, 1, B]), reshape(si, [Kc, A, 1, B])
+    orr, oi = cconv(sr, si, dft(A, 1, range(R)) / 8.0)  # [Kc][p1][1][p2]
+    op('Add', [op('Mul', [orr, orr]), op('Mul', [oi, oi])])
+    nodes[-1].output[0] = 'P'
+    outs = [h.make_tensor_value_info('P', T.FLOAT, [Kc, R, 1, B])]
+    g = h.make_graph(nodes, 'sdr_acq_s', ins, outs, inits)
+    m = h.make_model(g, opset_imports=[h.make_opsetid('', 13)])
+    m.ir_version = 8
+    onnx.checker.check_model(m)
+    return m
+
+# check ONNX graph of shared DFT by FFT ---------------------------------------
+def check_onnx_shift(file, A, B, Kc, R):
+    import onnxruntime as ort
+    M, W = A * B, Kc * A
+    rng = np.random.default_rng(1)
+    x = rng.standard_normal(M) + 1j * rng.standard_normal(M)
+    c = rng.standard_normal(M) + 1j * rng.standard_normal(M)
+    f0, n = 0.3141, np.arange(M)  # carrier of first bin (cyc/sample)
+    xw = (x * np.exp(-2j * np.pi * f0 * n)).reshape(1, A, 1, B)
+    cr = [np.roll(c, k).reshape(B, A) for k in range(Kc)]   # c[m - k]
+    cs = (np.concatenate(cr, axis=1)[None, :, None, :] if W <= MAX_W else
+        np.stack(cr)[:, :, None, :])
+    o = ort.InferenceSession(file).run(None, {k: v.astype(np.float32) for k, v in
+        {'xr': xw.real, 'xi': xw.imag, 'cr': cs.real, 'ci': cs.imag}.items()})[0]
+    ref = np.array([np.abs(np.fft.ifft(np.fft.fft(x * np.exp(-2j * np.pi *
+        (f0 + k / M) * n)) * c)) ** 2 / 64 for k in range(Kc)])[:, :R * B]
+    got = o.reshape(Kc, R * B)
+    return np.sqrt(np.mean((got - ref) ** 2) / np.mean(ref ** 2))
+
 # check ONNX graph of carrier folding by FFT (bins spaced by fs / M) ----------
 def check_onnx_fold(file, A, B, Kc, R):
     import onnxruntime as ort
@@ -365,7 +466,7 @@ def build_quant(name, A, B, Kc, fs, target):
 def main(argv):
     outdir = os.path.join(os.path.dirname(os.path.abspath(__file__)),
         '..', 'linux', 'rknn')
-    target, shapes, wipe, fold, quant, fs, i = 'rk3588', [], False, False, False, 16e6, 0
+    target, shapes, wipe, fold, quant, shift, fs, i = 'rk3588', [], False, False, False, False, 16e6, 0
     while i < len(argv):
         if argv[i] == '-o' and i + 1 < len(argv):
             outdir = argv[i + 1]; i += 1
@@ -377,13 +478,15 @@ def main(argv):
             fold = True
         elif argv[i] == '-q':
             fold = quant = True
+        elif argv[i] == '-s':
+            shift = True
         elif argv[i] == '-fs' and i + 1 < len(argv):
             fs = float(argv[i + 1]) * 1e6; i += 1
         else:
             shapes.append([int(v) for v in argv[i].split(':')])
         i += 1
     if not shapes:
-        print('usage: gen_rknn_acq.py [-o dir] [-t target] [-w|-f|-q] [-fs fs] M:Kc[:R] ...')
+        print('usage: gen_rknn_acq.py [-o dir] [-t target] [-w|-f|-q|-s] [-fs fs] M:Kc[:R] ...')
         return 1
     outdir = os.path.abspath(outdir)
     os.makedirs(outdir, exist_ok=True)
@@ -397,8 +500,12 @@ def main(argv):
             continue
         R = s[2] if len(s) > 2 else A // 2
         name = os.path.join(outdir, 'acq_M%d_K%d_R%d%s' % (M, Kc, R,
-            '_fq' if quant else ('_f' if fold else ('_w' if wipe else ''))))
-        if fold:
+            '_s' if shift else ('_fq' if quant else ('_f' if fold else
+            ('_w' if wipe else '')))))
+        if shift:
+            onnx.save(build_onnx_shift(A, B, Kc, R), name + '.onnx')
+            e = check_onnx_shift(name + '.onnx', A, B, Kc, R)
+        elif fold:
             onnx.save(build_onnx_fold(A, B, Kc, R), name + '.onnx')
             e = check_onnx_fold(name + '.onnx', A, B, Kc, R)
         else:

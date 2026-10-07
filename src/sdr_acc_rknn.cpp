@@ -10,6 +10,11 @@
 //  precompiled with RKNN-Toolkit2 (lib/build/gen_rknn_acq.py) for the shape
 //  (M, Kc, R), searched in the order:
 //    acq_M<M>_K<Kc>_R<R>_fq.rknn: INT8 of _f (option int8)
+//    acq_M<M>_K<Kc>_R<R>_s.rknn: shared DFT (shift mode): the forward DFT of
+//      the IF samples (wiped by the carrier of the first bin of the chunk) is
+//      computed once and the code DFT of bin k is rolled by k bins (host,
+//      when the code changes), |IDFT(X[m+k] C[m])| = |IDFT(X[m] C[m-k])|
+//      (bins spaced by fs / M) (option noshift: not used)
 //    acq_M<M>_K<Kc>_R<R>_f.rknn: carrier folded into the DFT weights and the
 //      twiddles (bins spaced by fs / M), input: IF samples wiped by the carrier
 //      of the first bin of the chunk (host) (option nofold: not used)
@@ -45,7 +50,10 @@
 //  The Doppler bins are split into chunks for the NPU cores (RK3588: 3). Each
 //  chunk is processed by a worker thread with its own RKNN contexts bound to
 //  one NPU core, so the host steps of a chunk overlap with the NPU execution
-//  of the other chunks.
+//  of the other chunks. The bins per chunk Kc are limited by Kc * A <= 16384
+//  (NPU tensor channels and memory, e.g. L1CP/L2CM direct search: 201/401
+//  bins in 9/21 chunks of 23/20 bins), and the chunks are processed in rounds
+//  of the NPU cores.
 //
 //  The DFTs are unitary and the inputs are normalized to unit RMS to keep the
 //  values inside the FP16 range (the model output powers are scaled by 1/64).
@@ -55,7 +63,7 @@
 //  pulsed interference (CW J/N 10 dB: C/N0 metric +11 dB, false detections),
 //  so they are not used by default.
 //
-//  options: [cores=n][,int8][,fp32][,mm][,hostwipe][,nofold][,model=dir]
+//  options: [cores=n][,int8][,noshift][,fp32][,mm][,hostwipe][,nofold][,model=dir]
 //           cores=n: number of NPU cores (worker threads) (default: 3)
 //           fp32   : FP32 output of matmul API (default: FP16)
 //           mm     : matmul API only (no RKNN models)
@@ -63,6 +71,8 @@
 //           nofold : no carrier folding (RKNN models acq_*_w.rknn with carrier
 //                  wipe-off in the model)
 //           int8   : INT8 models of carrier folding (acq_*_fq.rknn) if exist
+//           noshift: no shared DFT models (acq_*_s.rknn, code DFT rolled by
+//                  bin, used if exist by default)
 //                  instead of FP16 models (acq_*_f.rknn) (weak to interference)
 //           model=dir: directory of RKNN models (default: $SDR_ACC_RKNN_MODEL
 //                  or <plugin dir>/rknn)
@@ -77,6 +87,9 @@
 //  2026-10-07  1.1  carrier folded models (_f)
 //  2026-10-08  1.2  reset options by init, free RKNN models by exit,
 //                   prefetch in output accumulation
+//                   limit bins per inference (Kc * A <= 16384) with rounds
+//                   DFT factorization with B % 4 = 0 (M=320000: 500x640)
+//                   shared DFT models (_s) by default, add option noshift
 //
 #include <algorithm>
 #include <chrono>
@@ -100,6 +113,7 @@
 #include "sdr_acc.h"
 
 #define MAX_CORE   3        // max number of NPU cores
+#define MAX_KCH    16384    // max bins x A per inference (channels of NPU tensors)
 #define MIN_FACT   8        // min factor of DFT size
 #define MAX_KDIM   10240    // max contracted dimension of matmul
 #define PI         3.1415926535897932
@@ -140,6 +154,7 @@ struct model_t {
 #define RM_WIPE    1        // model kind: carrier wipe-off in model (_w)
 #define RM_FOLD    2        // model kind: carrier folded into DFT (_f)
 #define RM_FOLDQ   3        // model kind: INT8 of RM_FOLD (_fq)
+#define RM_SHIFT   4        // model kind: shared DFT, code rolled by bin (_s)
 struct rmodel_t {
     rknn_context ctx = 0;
     int nin = 0;
@@ -188,6 +203,7 @@ struct worker_t {
     int k0 = 0;             // first bin of chunk
     int ok = 0;
     double t[9] = {0};      // profile of steps (thread CPU time) (s)
+    std::vector<f16_t> cs;  // code DFT with wrapped rows (shift mode)
 };
 
 static int ncore = MAX_CORE;
@@ -196,6 +212,7 @@ static int use_model = 1;           // use RKNN models (0: matmul API only)
 static int wipe_model = 1;          // carrier wipe-off in RKNN models
 static int fold_model = 1;          // carrier folded into DFT in RKNN models
 static int int8_model = 0;          // INT8 RKNN models (_fq)
+static int shift_model = 1;         // shared DFT RKNN models (_s)
 static std::string model_dir;       // directory of RKNN models
 static int nref = 0;
 static int prof_on = 0;
@@ -230,7 +247,7 @@ static int pad(int n, int a) { return (n + a - 1) / a * a; }
 static int factorize(int M, int *A, int *B)
 {
     for (int a = (int)std::sqrt((double)M); a >= MIN_FACT; a--) {
-        if (M % a) continue;
+        if (M % a || (M / a) % 4) continue; // B % 4 = 0 (native layout width)
         *A = a;
         *B = M / a;
         return 2 * *B <= MAX_KDIM;
@@ -597,7 +614,7 @@ static rmodel_t *get_rmodel(worker_t *w, int M, int Kc, int R, int kind)
 {
     static const char *names[MAX_MIN] = {"xr", "xi", "cr", "ci", "ar", "ai",
         "br", "bi"};
-    static const char *sfx[] = {"", "_w", "_f", "_fq"};
+    static const char *sfx[] = {"", "_w", "_f", "_fq", "_s"};
     auto key = std::make_tuple(M, Kc, R, kind);
     auto it = w->rmodels.find(key);
     if (it != w->rmodels.end()) return it->second.get(); // NULL: no model
@@ -810,6 +827,44 @@ static void step_wipe_nat(worker_t *w, const call_t *c, rmodel_t *m)
     }
 }
 
+// code DFT rolled by bin to native input (shift mode, FP16) ------------------
+//   cr, ci [0][k2][0][k*A+k1] (bins along W) or [k][k2][0][k1] (bins in batch),
+//   value C[(k1+A*k2-k) mod M] = e[i1][1+i2] with i1 = (k1-k) mod A and
+//   i2 = k2 (k1 >= k) or k2-1 (k1 < k), e[i1][0] = C[i1+A*(B-1)] (8 channels of
+//   the native layout copied at once)
+static void step_code_shift(worker_t *w, const call_t *c, rmodel_t *m)
+{
+    int A = c->A, B = c->B, B1 = B + 1;
+    w->cs.resize(2 * (size_t)A * B1);
+    for (int j = 0; j < 2; j++) {
+        f16_t *e = w->cs.data() + (size_t)j * A * B1;
+        for (int i1 = 0; i1 < A; i1++) {
+            const f16_t *ct = c->ct + (size_t)i1 * B * 2 + j;
+            f16_t *r = e + (size_t)i1 * B1;
+            r[0] = ct[(B-1)*2];
+            for (int i2 = 0; i2 < B; i2++) r[1+i2] = ct[i2*2];
+        }
+        const rknn_tensor_attr &aj = m->ia[2+j];
+        f16_t *p = (f16_t *)m->in[2+j]->virt_addr;
+        int nb = aj.dims[0], C2 = aj.dims[4];
+        for (int k = 0; k < c->Kc; k++) {
+            int n = nb > 1 ? k : 0, x0 = nb > 1 ? 0 : k * A;
+            for (int k1 = 0; k1 < A; k1++) {
+                const f16_t *r = k1 >= k ? e + (size_t)(k1 - k) * B1 + 1 :
+                    e + (size_t)(A + k1 - k) * B1;
+                int k2 = 0;
+                if (C2 == 8) {
+                    for ( ; k2 + 8 <= B; k2 += 8) {
+                        memcpy(p + nat_off(aj, n, k2, x0 + k1), r + k2, 16);
+                    }
+                }
+                for ( ; k2 < B; k2++) p[nat_off(aj, n, k2, x0 + k1)] = r[k2];
+            }
+        }
+    }
+    m->code_gen = c->code_gen;
+}
+
 // code DFT to native input: cr, ci [0][k2][0][r*A+k1] (replicated along W) ---
 //   (the first replica written and the others copied in the native layout)
 static void step_code_nat(const call_t *c, rmodel_t *m)
@@ -907,7 +962,10 @@ static int run_chunk_model(worker_t *w, const call_t *c, rmodel_t *m)
     if (m->kind == RM_WIPE) step_wipe_nat(w, c, m);
     else step_carr_nat(w, c, m, m->kind >= RM_FOLD ? 1 : c->Kc);
     t1 = cputime(); w->t[0] += t1 - t0; t0 = t1;
-    if (m->code_gen != c->code_gen) step_code_nat(c, m);
+    if (m->code_gen != c->code_gen) {
+        if (m->kind == RM_SHIFT) step_code_shift(w, c, m);
+        else step_code_nat(c, m);
+    }
     t1 = cputime(); w->t[4] += t1 - t0; t0 = t1;
     if (rknn_run(m->ctx, NULL) < 0) return 0;
     t1 = cputime(); w->t[1] += t1 - t0; t0 = t1;
@@ -925,6 +983,9 @@ static int run_chunk(worker_t *w, const call_t *c)
     rmodel_t *rm = NULL;
     if (int8_model && fold_model && c->S == 1) {
         rm = get_rmodel(w, c->M, c->Kc, c->R, RM_FOLDQ);
+    }
+    if (!rm && shift_model && fold_model && c->S == 1) {
+        rm = get_rmodel(w, c->M, c->Kc, c->R, RM_SHIFT);
     }
     if (!rm && fold_model && c->S == 1) {
         rm = get_rmodel(w, c->M, c->Kc, c->R, RM_FOLD);
@@ -995,6 +1056,7 @@ static int rk_init(const char *opt)
     out_fp32 = 0;
     use_model = wipe_model = fold_model = 1;
     int8_model = 0;
+    shift_model = 1;
     model_dir.clear();
     std::string s = opt ? opt : "";
     for (size_t p = 0; p < s.size(); ) {
@@ -1008,6 +1070,8 @@ static int rk_init(const char *opt)
         else if (t == "hostwipe") wipe_model = fold_model = 0;
         else if (t == "nofold") fold_model = 0;
         else if (t == "int8") int8_model = 1;
+        else if (t == "shift") shift_model = 1; // (default)
+        else if (t == "noshift") shift_model = 0;
         else if (t.compare(0, 6, "model=") == 0) model_dir = t.substr(6);
         else if (!t.empty()) fprintf(stderr, "sdr_acc_rknn: unknown option %s\n",
             t.c_str());
@@ -1109,12 +1173,17 @@ static int search_code(const float *x, const int8_t *x8, const float *code,
     std::lock_guard<std::mutex> lock(call_mtx);
     double t0 = now();
 
-    // Doppler bins per worker (padded bins extrapolated)
-    int nw = std::min(ncore, K), Kc = (K + nw - 1) / nw;
-    nw = (K + Kc - 1) / Kc;
+    // Doppler bins per chunk (padded bins extrapolated): nch chunks of Kc bins
+    // (Kc * A <= MAX_KCH) processed by nw workers in rounds
+    int nw = std::min(ncore, K), kmax = std::max(1, MAX_KCH / A);
+    int nch = std::max(nw, (K + kmax - 1) / kmax);
+    nch = (nch + nw - 1) / nw * nw;
+    int Kc = (K + nch - 1) / nch;
+    nch = (K + Kc - 1) / Kc;
+    nw = std::min(nw, nch);
     static std::vector<double> fcc;
-    fcc.resize((size_t)Kc * nw);
-    for (int k = 0; k < Kc * nw; k++) {
+    fcc.resize((size_t)Kc * nch);
+    for (int k = 0; k < Kc * nch; k++) {
         fcc[k] = k < K ? fc[k] : fc[K-1] + (k - K + 1) *
             (K > 1 ? fc[1] - fc[0] : 0.0);
     }
@@ -1162,35 +1231,38 @@ static int search_code(const float *x, const int8_t *x8, const float *code,
     double s = 1.0 / ((double)s_x * s_c * M);
     call_t c = {M, A, B, Kc, (nout + B - 1) / B, nout, ldP, fs, fcc.data(),
         K, xt.data(), ct.data(), code_gen, cmax, dop_step(M, fs, fcc.data(),
-        Kc * nw), get_table(M, A, B), P, (float)(s * s)};
+        Kc * nch), get_table(M, A, B), P, (float)(s * s)};
     double t1 = now();
 
-    // run workers
-    {
-        std::lock_guard<std::mutex> lk(wk_mtx);
-        for (int i = 0; i < nw; i++) {
-            workers[i].call = &c;
-            workers[i].k0 = i * Kc;
-            workers[i].ok = 0;
-        }
-        wk_nact = nw;
-        wk_pend = ncore;
-        wk_gen++;
-    }
-    wk_cv.notify_all();
-    {
-        std::unique_lock<std::mutex> lk(wk_mtx);
-        done_cv.wait(lk, [] { return wk_pend == 0; });
-    }
+    // run workers (rounds of nw chunks)
     int ok = 1;
-    for (int i = 0; i < nw; i++) ok &= workers[i].ok;
+    for (int r0 = 0; r0 < nch && ok; r0 += nw) {
+        int na = std::min(nw, nch - r0);
+        {
+            std::lock_guard<std::mutex> lk(wk_mtx);
+            for (int i = 0; i < na; i++) {
+                workers[i].call = &c;
+                workers[i].k0 = (r0 + i) * Kc;
+                workers[i].ok = 0;
+            }
+            wk_nact = na;
+            wk_pend = ncore;
+            wk_gen++;
+        }
+        wk_cv.notify_all();
+        {
+            std::unique_lock<std::mutex> lk(wk_mtx);
+            done_cv.wait(lk, [] { return wk_pend == 0; });
+        }
+        for (int i = 0; i < na; i++) ok &= workers[i].ok;
+    }
     ncall++;
     if (prof) {
         prof->t_in = t1 - t0;
         prof->t_exec = now() - t1;
         prof->t_out = 0.0;
-        prof->bytes_in = 2.0 * 2.0 * Kc * nw * M;
-        prof->bytes_out = 2.0 * 2.0 * Kc * nw * c.R * B;
+        prof->bytes_in = 2.0 * 2.0 * Kc * nch * M;
+        prof->bytes_out = 2.0 * 2.0 * Kc * nch * c.R * B;
     }
     return ok;
 }
