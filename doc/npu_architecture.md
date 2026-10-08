@@ -959,6 +959,15 @@ found, 176 locked at the end (`cand_sigs.sh`). L6D/L6E are excluded from the
 capacity runs (the CSK demodulation by a chip-domain FFT per code period
 costs 0.23 core per channel, 6x of the other signals).
 
+SBAS, IRNSS (NavIC) and QZSS augmentation signals (`cand2_sigs.sh`, 174
+candidates, 300 s, rknn): 33 signals found, ~30 locked at the end: SBAS L1CA
+PRN 122, 126, 128, 129, 130, 134, 137, 142, 143, SBAS L5I 122, 128, 130,
+134, 142, 143, SBAS L5Q 130, 134, 142, 143 (134 and 143 at C/N0 15-29 dB-Hz
+at the end: possible false locks, the SBAS L5Q secondary code to be
+checked), IRNSS I5S 3, 7, 10, I1SD/I1SP 10, QZSS L1S 184, 185, 189 and
+L5SI/L5SQ 184, 185, 189. The all-in-view set of the data is therefore ~200
+signals without L6 (~206 with L6D).
+
 Capacity runs: N tracked signals (stratified by signal type from the 172
 locked signals except L6D; N > 172 by duplicated channels) + 227 never
 detected candidates of `acq_sigs.sh` searched continuously (one search at a
@@ -1122,6 +1131,34 @@ FFTW wisdom of the same sizes; C/N0 of the decimated signals -0.5 dB):
 
 (rknn: shared DFT models `_s`; all with `-rcv_prio 10`; single runs.)
 
+Comparison with the CPU backends with the decimation (live-like):
+
+| N | configuration | LOCK at end | max BUFF | CPU | user CPU |
+|---|---|---|---|---|---|
+| 230 | PocketFFT `cpu` (original default) | 207 | 21% | 90% | 31.4 min |
+| 230 | FFTW `cpu` | 214 | 25% | 92% | 33.5 min |
+| 230 | FFTW `cpu_opt` (shared DFT on the CPU) | 218 | 17% | 93% | 33.9 min |
+| 230 | rknn `_s`, acq on A55 | 217 | 10% | 91% | 31.6 min |
+| 260 | PocketFFT `cpu` | 210 | 47% | 94% | 32.3 min |
+| 260 | FFTW `cpu` | 214 | 26% | 94% | 34.0 min |
+| 260 | FFTW `cpu_opt` | 235 (max 237) | 71% | 99% | 34.6 min |
+| 260 | rknn `_s`, acq on A55 | 230 (max 238) | 119% (overflow) | 99% | 32.6 min |
+
+Acquisition with the shared DFT on both sides (`quick_acq.sh`, PASS), time /
+CPU time per search: A76 FFTW `cpu_opt` L1CA 129 / 129 ms, E1B 625 / 609 ms
+vs rknn `_s` 119 / 29 ms, 585 / 138 ms; A55 563 / 563 ms, 3692 / 3676 ms vs
+176 / 97 ms, 795 / 383 ms.
+
+- With the shared DFT on the CPU (`cpu_opt`) the best CPU-only receiver tracks
+  as many channels as the NPU receiver (N=230: 218 vs 217; N=260: 235 vs
+  230-238, single runs). The serial search uses at most ~1 core, and with
+  `cpu_opt` that core is used more efficiently, so the NPU does not increase
+  the channel capacity of this receiver on the RK3588; it reduces the CPU
+  time of the search to 1/4-1/10 (A55: 3-5x faster search) and the CPU time
+  of the receiver by 0.4-0.6 core at the same load. The capacity gains come
+  from the decimation and the shared DFT, i.e. from the tracking cost and the
+  search efficiency, not from the offload.
+
 - Without decimation the real-time limit is ~185 channels (N=200: NPU 184
   locked at BUFF 85%, FFTW 170; N=230: both overflow).
 - The decimation of the narrowband RF CHs raises it to ~217-230 channels
@@ -1131,7 +1168,39 @@ FFTW wisdom of the same sizes; C/N0 of the decimated signals -0.5 dB):
   acquiring up to the tracking capacity (N=260: 230-238, then overflow),
   while the FFTW search does not complete the cycle of 487 channels in 300 s.
 
-### 13.15 Findings
+### 13.15 NEON carrier mixing of the tracking correlator
+
+The carrier mixing (`mix_carr_p()`, 42% of the CPU time in 13.14) looked up
+a LUT of 64K entries (IF sample x 256 carrier phases) one sample at a time.
+The NEON version looks up the carrier (I, Q) of 16 samples by one 64-byte
+table lookup (`vqtbl4q`, 64 phases = 6 bits) and multiplies in int8 (the
+wrapped products give the exact sum, |result| <= 127). With 256 phases (4
+chained lookups) it was slower than the LUT (A76 22.8 vs 20.9 us). The phase
+error of 6 bits is +/-2.8 deg (correlation loss 0.002 dB). `-DMIX_LUT_SCALAR`
+builds the original LUT.
+
+- Correlator (`bench_sdr_corr`, L1CA, 4 taps, us per channel-epoch, 16 / 64 /
+  256 ch): A76 20.9 / 21.0 / 22.9 -> 14.4 / 14.6 / 16.2 (1.45x), A55 95.0 /
+  94.3 / 94.0 -> 52.6 / 52.4 / 55.4 (1.8x). Whole tracking (`bench_sdr_trk`,
+  50 ch, 5 s, A76): 30.1 -> 23.1 us per channel-epoch (1.30x).
+- Accuracy vs the LUT (same data): C/N0 within +/-0.02 dB, code < 0.1 m,
+  Doppler 0.01-0.05 Hz and no ADR difference for all channels except 3 weak
+  ones (C/N0 34-35 dB-Hz) whose loops took different paths. Acquisition
+  regression (`quick_acq.sh`, cpu, fftw+cpu): PASS.
+
+Capacity with decimation, live-like (13.14 conditions):
+
+| N | configuration | LOCK at end | max BUFF | CPU (A55 / A76) | user CPU |
+|---|---|---|---|---|---|
+| 260 | rknn `_s`, acq on A55 | 252 | 6% | 81% (85 / 77) | 27.5 min |
+| 260 | FFTW `cpu_opt` | 249 | 8% | 87% (89 / 86) | 31.4 min |
+| 300 | rknn `_s`, acq on A55 | 284 | 8% | 88% (91 / 86) | 29.5 min |
+| 300 | FFTW `cpu_opt` | 286 | 13% | 92% (92 / 91) | 32.6 min |
+
+The capacity rises from ~217-230 to > 285 channels (the limit is estimated at
+~320). The NPU receiver uses ~0.6 core less CPU at the same load.
+
+### 13.16 Findings
 
 - On RK3588 the NPU acquisition (default `_f`) is 1.5x faster than FFTW on
   the A76 and 4.8-5.0x on the A55 with 1/8-1/14 of the CPU time (INT8: 2.1-2.4x
@@ -1143,13 +1212,15 @@ FFTW wisdom of the same sizes; C/N0 of the decimated signals -0.5 dB):
   products.
 - In the receiver the NPU halves the search cycle of all signals and, with
   the acquisition on the A55, keeps more channels locked in real time near
-  the CPU limit (N=200: 186 vs 167 with FFTW), because its search does not
-  slow down when the CPU is saturated. The CPU saving at the same load is
-  small (0.4-0.7 core), since the CPU search is serial (~1 core).
+  the CPU limit than FFTW without the shared DFT (N=200: 186 vs 167), because
+  its search does not slow down when the CPU is saturated. Against the best
+  CPU-only receiver (FFTW `cpu_opt`, shared DFT) the channel capacity is the
+  same (13.14); the NPU saves 0.4-0.6 core and makes the search on the A55 as
+  fast as on the A76.
 - ROCK 5B tracks the all-in-view set without L6 (172 signals) in real time
   with continuous search of 227 other signals; with a live-like input the
   limit is ~185 channels, ~217-230 with the decimation of the narrowband RF
-  CHs to 8 MHz (13.14). The capacity is set by the tracking correlators
+  CHs to 8 MHz (13.14) and > 285 with the NEON carrier mixing (13.15). The capacity is set by the tracking correlators
   (74% of the CPU); the NPU acquisition costs ~0.1 core (FFTW ~0.6 core).
 - The host CPU cost of the NPU path is the I/O in the native layout; FP32 or
   NHWC inputs cost more CPU than the FFT itself.
