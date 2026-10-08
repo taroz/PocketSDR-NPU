@@ -1168,6 +1168,30 @@ vs rknn `_s` 119 / 29 ms, 585 / 138 ms; A55 563 / 563 ms, 3692 / 3676 ms vs
   acquiring up to the tracking capacity (N=260: 230-238, then overflow),
   while the FFTW search does not complete the cycle of 487 channels in 300 s.
 
+Decimator (`sdr_dec_new()`, `sdr_dec_apply()`): polyphase FIR lowpass
+(12 x D + 1 taps, Blackman window, cutoff 0.9 x fs/(2D), symmetric taps,
+NEON unpacking by phase with `vld2q`/`vld3q`/`vld4q`), output requantized to
+4-bit I/Q with an adaptive gain (output RMS ~3), D = 2, 3, 4, run by one
+thread per decimated RF CH in parallel with the IF input thread (the
+channels read up to the last decimated cycle). C/N0 loss vs no decimation
+(16 -> 8 MHz, 68 signals): the first 9-tap prototype -0.52 dB, the decimator
+-0.41 dB (BPSK signals L1CA -0.14, L2CM +0.06, G2CA -0.14 dB; the remaining
+loss is the BOC signals E1B/C, L1CP/D, B1C, -0.4 to -1.0 dB, whose +/-6 MHz
+components are outside 8 MHz). Each decimator costs ~14% of a core (16 MHz),
+so it pays off only for the RF CHs with many channels. N=300 (13.15
+correlator, rknn, live-like):
+
+| decimated RF CHs | LOCK at end | max BUFF | CPU | user CPU |
+|---|---|---|---|---|
+| none | 239 | 144% (overflow) | 99% | 31.0 min |
+| L1 (`-dec 1:2`) | 271 | 31% | 92% | 30.5 min |
+| L1, B1I (`-dec 1:2,2:2`) | 276 | 10% | 91% | 30.0 min |
+| L1, B1I, G1, L2, G2 | 278 | 64% | 94% | 30.0 min |
+| all 5 by the 9-tap prototype | 284 | 8% | 88% | 29.5 min |
+
+For 24 MHz: `-dec 1:2,2:3` (L1 at 12 MHz to keep the BOC signals, B1I at 8
+MHz).
+
 ### 13.15 NEON carrier mixing of the tracking correlator
 
 The carrier mixing (`mix_carr_p()`, 42% of the CPU time in 13.14) looked up
