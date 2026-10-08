@@ -90,6 +90,7 @@
 //                   limit bins per inference (Kc * A <= 16384) with rounds
 //                   DFT factorization with B % 4 = 0 (M=320000: 500x640)
 //                   shared DFT models (_s) by default, add option noshift
+//                   fix tolerance of uniform Doppler bins (single precision)
 //
 #include <algorithm>
 #include <chrono>
@@ -1143,8 +1144,8 @@ static int dop_step(int M, double fs, const double *fc, int K)
     double s = (fc[1] - fc[0]) * M / fs;
     int S = (int)std::floor(s + 0.5);
     if (S < 1) return 0;
-    for (int k = 0; k < K; k++) {
-        if (std::fabs((fc[k] - fc[0]) * M / fs - (double)S * k) > 1e-6) return 0;
+    for (int k = 0; k < K; k++) { // (tolerance for single precision Doppler)
+        if (std::fabs((fc[k] - fc[0]) * M / fs - (double)S * k) > 1e-3) return 0;
     }
     return S;
 }
