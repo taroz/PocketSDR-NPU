@@ -67,6 +67,7 @@
 //                   add API sdr_search_code2(), sdr_search_code_cpu()
 //  2026-10-08  1.33 NEON carrier mixing of 64 phases by table lookup (vqtbl4q)
 //                   in mix_carr_p() (-DMIX_LUT_SCALAR: LUT of 256 phases)
+//                   (AVX2: LUT, -DMIX_PHASE6_AVX2: 64 phases, not faster)
 //
 #include <math.h>
 #include <stdarg.h>
@@ -867,7 +868,67 @@ static void mix_carr_p(const sdr_buff_t *buff, int ix, int N, uint32_t p,
 {
     const uint8_t *data = buff->data + ix;
     int i = 0;
-#if defined(AVX2)
+#if defined(AVX2) && defined(MIX_PHASE6_AVX2)
+    // carrier of 64 phases (6 bits) by 4 table lookups of 16 bytes (vpshufb)
+    // selected by the upper 2 bits, products by vpmaddubsw (|data| x carrier
+    // with the sign of the data, I and Q interleaved), 32 samples per loop
+    // (evaluated, not used by default: correlator 1.10x on a P-core, 0.85x on
+    // an E-core of Intel Core Ultra vs the LUT)
+    __m256i t[2][4];
+    for (int k = 0; k < 4; k++) {
+        t[0][k] = _mm256_broadcastsi128_si256(_mm_loadu_si128((const __m128i *)(carr_6I + 16 * k)));
+        t[1][k] = _mm256_broadcastsi128_si256(_mm_loadu_si128((const __m128i *)(carr_6Q + 16 * k)));
+    }
+    __m256i bias = _mm256_set1_epi8(tbl == mix_tbl_b ? (char)0x80 : 0);
+    __m256i m0f = _mm256_set1_epi8(0x0F), m08 = _mm256_set1_epi8(8);
+    __m256i m03 = _mm256_set1_epi8(3);
+    __m256i ys = _mm256_set1_epi32(s * 8), ys32 = _mm256_set1_epi32(s * 32);
+    __m256i yp0 = _mm256_set_epi32(p+s*7, p+s*6, p+s*5, p+s*4, p+s*3, p+s*2, p+s, p);
+    __m256i yp1 = _mm256_add_epi32(yp0, ys), yp2 = _mm256_add_epi32(yp1, ys);
+    __m256i yp3 = _mm256_add_epi32(yp2, ys);
+    __m256i perm = _mm256_setr_epi32(0, 4, 1, 5, 2, 6, 3, 7);
+    
+    for ( ; i < N - 31; i += 32) {
+        // phase index (6 bits) of 32 samples in order
+        __m256i a01 = _mm256_packus_epi32(_mm256_srli_epi32(yp0, 26), _mm256_srli_epi32(yp1, 26));
+        __m256i a23 = _mm256_packus_epi32(_mm256_srli_epi32(yp2, 26), _mm256_srli_epi32(yp3, 26));
+        __m256i idx = _mm256_permutevar8x32_epi32(_mm256_packus_epi16(a01, a23), perm);
+        yp0 = _mm256_add_epi32(yp0, ys32); yp1 = _mm256_add_epi32(yp1, ys32);
+        yp2 = _mm256_add_epi32(yp2, ys32); yp3 = _mm256_add_epi32(yp3, ys32);
+        __m256i lo = _mm256_and_si256(idx, m0f), hi = _mm256_srli_epi16(idx, 4);
+        hi = _mm256_and_si256(hi, m03);
+        __m256i c[2];
+        for (int j = 0; j < 2; j++) {
+            __m256i r = _mm256_shuffle_epi8(t[j][0], lo);
+            r = _mm256_blendv_epi8(r, _mm256_shuffle_epi8(t[j][1], lo), _mm256_cmpeq_epi8(hi, _mm256_set1_epi8(1)));
+            r = _mm256_blendv_epi8(r, _mm256_shuffle_epi8(t[j][2], lo), _mm256_cmpeq_epi8(hi, _mm256_set1_epi8(2)));
+            r = _mm256_blendv_epi8(r, _mm256_shuffle_epi8(t[j][3], lo), _mm256_cmpeq_epi8(hi, m03));
+            c[j] = r;
+        }
+        // 4-bit I, Q (sign extended) of the IF samples
+        __m256i d = _mm256_loadu_si256((const __m256i *)(data + i));
+        __m256i dI = _mm256_sub_epi8(_mm256_xor_si256(_mm256_and_si256(d, m0f), m08), m08);
+        __m256i dQ = _mm256_sub_epi8(_mm256_xor_si256(_mm256_and_si256(_mm256_srli_epi16(d, 4), m0f), m08), m08);
+        __m256i aI = _mm256_abs_epi8(dI), aQ = _mm256_abs_epi8(dQ);
+        __m256i sIcI = _mm256_sign_epi8(c[0], dI), sIcQ = _mm256_sign_epi8(c[1], dI);
+        __m256i sQcI = _mm256_sign_epi8(c[0], dQ), sQcQ = _mm256_sign_epi8(c[1], dQ);
+        __m256i nQcQ = _mm256_sub_epi8(_mm256_setzero_si256(), sQcQ);
+        // |I|, |Q| interleaved x (sign(I)cI, -sign(Q)cQ) -> I*cI - Q*cQ (16 bit)
+        __m256i ab_lo = _mm256_unpacklo_epi8(aI, aQ), ab_hi = _mm256_unpackhi_epi8(aI, aQ);
+        __m256i rI_lo = _mm256_maddubs_epi16(ab_lo, _mm256_unpacklo_epi8(sIcI, nQcQ));
+        __m256i rI_hi = _mm256_maddubs_epi16(ab_hi, _mm256_unpackhi_epi8(sIcI, nQcQ));
+        __m256i rQ_lo = _mm256_maddubs_epi16(ab_lo, _mm256_unpacklo_epi8(sIcQ, sQcI));
+        __m256i rQ_hi = _mm256_maddubs_epi16(ab_hi, _mm256_unpackhi_epi8(sIcQ, sQcI));
+        // (I, Q) bytes interleaved: low byte I, high byte Q of each 16 bit
+        __m256i o_lo = _mm256_or_si256(_mm256_and_si256(rI_lo, _mm256_set1_epi16(0xFF)), _mm256_slli_epi16(rQ_lo, 8));
+        __m256i o_hi = _mm256_or_si256(_mm256_and_si256(rI_hi, _mm256_set1_epi16(0xFF)), _mm256_slli_epi16(rQ_hi, 8));
+        o_lo = _mm256_xor_si256(o_lo, bias);
+        o_hi = _mm256_xor_si256(o_hi, bias);
+        // unpack order (lanes): o_lo = samples 0-7, 16-23; o_hi = 8-15, 24-31
+        _mm256_storeu_si256((__m256i *)(IQ + i), _mm256_permute2x128_si256(o_lo, o_hi, 0x20));
+        _mm256_storeu_si256((__m256i *)(IQ + i + 16), _mm256_permute2x128_si256(o_lo, o_hi, 0x31));
+    }
+#elif defined(AVX2)
     __m256i yp = _mm256_set_epi32(p+s*7, p+s*6, p+s*5, p+s*4, p+s*3, p+s*2, p+s, p);
     __m256i ys = _mm256_set1_epi32(s*8);
     
