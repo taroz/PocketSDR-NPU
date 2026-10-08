@@ -400,8 +400,10 @@ The input can be a local file, a TCP stream, a Pocket SDR FE device, or a SoapyS
     the PVT every cycle, to keep it from waiting for the CPU under a high
     tracking load (Linux, needs root or CAP_SYS_NICE/rtprio). [not changed]
 - `-dec rfch:D[,...]`
-  - Decimate the IF data of the RF CH(s) (IQ sampling) by D (2 or 4) after a
-    digital LPF (cutoff 0.9 x fs/(2D)) for the search and tracking of the
+  - Decimate the IF data of the RF CH(s) (IQ sampling) by D (2, 3 or 4) by a
+    polyphase FIR lowpass (12 x D + 1 taps, Blackman window, cutoff 0.9 x
+    fs/(2D), output requantized to 4-bit I/Q with an adaptive gain) for the
+    search and tracking of the
     signals of the RF CH at fs/D. For the RF CHs of narrowband signals only
     (e.g. L1CA, B1I, G1CA, L2CM; the tracking cost per channel is roughly
     proportional to the sampling rate). [none]

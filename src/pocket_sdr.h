@@ -132,6 +132,7 @@ typedef struct {int8_t  I, Q;} sdr_cpx16_t; // 16(8+8)   bits complex type
 typedef struct {int32_t I, Q;} sdr_cpx64_t; // 64(32+32) bits complex type
 typedef float sdr_cpx_t[2];      // single precision complex type
 typedef struct sdr_lpf_tag sdr_lpf_t; // LPF type
+typedef struct sdr_dec_tag sdr_dec_t; // decimator type
 typedef struct sdr_web_tag sdr_web_t; // Web UI server type
 
 #ifdef WIN32
@@ -433,6 +434,9 @@ typedef struct sdr_rcv_tag {    // SDR receiver type
     int rcv_prio;               // real-time priority of IF input thread (0:off)
     int dec[SDR_MAX_RFCH];      // decimation factor of RF CH (option -DEC, 0,1: off)
     sdr_buff_t *buffd[SDR_MAX_RFCH]; // decimated IF data buffers (NULL: off)
+    sdr_dec_t *decf[SDR_MAX_RFCH]; // decimators of RF CHs (NULL: off)
+    int64_t dec_ix[SDR_MAX_RFCH]; // last decimated IF data cycle (cyc)
+    sdr_thread_t dec_th[SDR_MAX_RFCH]; // decimation threads
     int ngrp;                   // number of batched correlator groups
     void *grp[SDR_MAX_NCH];     // batched correlator groups
     sdr_thread_t thread;        // SDR receiver thread
@@ -567,6 +571,9 @@ int sdr_gen_fftw_wisdom(const char *file, int N);
 sdr_lpf_t *sdr_lpf_new(double fc, double fs);
 void sdr_lpf_free(sdr_lpf_t *lpf);
 void sdr_lpf_apply(sdr_lpf_t *lpf, sdr_cpx8_t *data, int N);
+sdr_dec_t *sdr_dec_new(int D, int ntap, double fc, double fs);
+void sdr_dec_free(sdr_dec_t *dec);
+void sdr_dec_apply(sdr_dec_t *dec, const sdr_cpx8_t *in, int N, sdr_cpx8_t *out);
 
 // sdr_acc.c
 int sdr_acc_init(const char *backend);
