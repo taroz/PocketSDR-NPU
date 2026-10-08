@@ -1188,6 +1188,15 @@ builds the original LUT.
   ones (C/N0 34-35 dB-Hz) whose loops took different paths. Acquisition
   regression (`quick_acq.sh`, cpu, fftw+cpu): PASS.
 
+x86 (AVX2, Intel Core Ultra; evaluation code in commit 9c1e219, removed
+afterwards, `-DMIX_PHASE6_AVX2`): the 64-entry lookup needs
+4 `vpshufb` + 3 blends and the int8 products `vpmaddubsw` on |data| with the
+sign moved to the carrier; correlator (16 / 64 / 256 ch) P-core 6.1 -> 5.55 us
+(1.10x), E-core 12.2 -> 14.3 us (0.85x), LP E-core 13.1 -> 15.3 us (0.86x);
+the tracking results are the same as the NEON version (`cmp_trk.py` PASS, lock
+and sync states identical). The x86 build therefore keeps the LUT: the
+improvement is for NEON (ARM) only.
+
 Capacity with decimation, live-like (13.14 conditions):
 
 | N | configuration | LOCK at end | max BUFF | CPU (A55 / A76) | user CPU |
