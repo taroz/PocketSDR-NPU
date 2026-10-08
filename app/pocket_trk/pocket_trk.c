@@ -62,7 +62,7 @@ static const char *usage_text[] = {
     "       [-log path] [-nmea path] [-rtcm path] [-raw path] ... [-opt file]",
     "       [-arch nch] [-geom file] [-acc backend] [-tacc backend]",
     "       [-cpu_acq cpus] [-cpu_trk cpus] [-rcv_prio prio]",
-    "       [-dec rfch:D[,...]] [file]",
+    "       [-dec rfch:D[:foff][,...]] [file]",
     NULL
 };
 

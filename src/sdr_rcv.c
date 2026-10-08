@@ -29,8 +29,9 @@
 //  2026-10-08  1.15 add CPU affinity options -CPU_ACQ, -CPU_TRK
 //                   fix 1 ms sleep per read of stream input
 //                   add option -RCV_PRIO
-//                   add option -DEC (decimation of RF CH for tracking, by
-//                   decimation threads in parallel with the IF input thread)
+//                   add option -DEC (decimated sub-bands of RF CHs for
+//                   tracking, by decimation threads in parallel with the IF
+//                   input thread, group delay compensated)
 //
 #include "pocket_sdr.h"
 
@@ -95,14 +96,12 @@ static int64_t get_buff_ix(sdr_rcv_t *rcv)
     return ix;
 }
 
-// get IF data buffer pointer of RF CH (decimated: last decimated cycle) -------
-static int64_t get_buff_ix_ch(sdr_rcv_t *rcv, int rf_ch)
+// get IF data buffer pointer of sub-band (-1: RF CH) (decimated: last cycle) -
+static int64_t get_buff_ix_ch(sdr_rcv_t *rcv, int sub)
 {
     sdr_mutex_lock(&rcv->mtx);
     int64_t ix = rcv->ix;
-    if (rf_ch < SDR_MAX_RFCH && rcv->decf[rf_ch] && rcv->dec_ix[rf_ch] < ix) {
-        ix = rcv->dec_ix[rf_ch];
-    }
+    if (sub >= 0 && rcv->dec_ix[sub] < ix) ix = rcv->dec_ix[sub];
     sdr_mutex_unlock(&rcv->mtx);
     return ix;
 }
@@ -530,6 +529,7 @@ static sdr_ch_th_t *ch_th_new(const char *sig, int prn, double fi, double fs,
         return NULL;
     }
     th->rcv = rcv;
+    th->sub = -1;
     sdr_mutex_init(&th->mtx);
     return th;
 }
@@ -557,24 +557,22 @@ static void ch_th_udpvt(sdr_ch_th_t *th)
 }
 
 // IF data buffer and samples per cycle of SDR receiver CH ---------------------
-static const sdr_buff_t *ch_buff(const sdr_rcv_t *rcv, const sdr_ch_t *ch)
+static const sdr_buff_t *ch_buff(const sdr_ch_th_t *th)
 {
-    int k = ch->rf_ch;
-    return k < SDR_MAX_RFCH && rcv->buffd[k] ? rcv->buffd[k] : rcv->buff[k];
+    return th->sub >= 0 ? th->rcv->buffd[th->sub] : th->rcv->buff[th->ch->rf_ch];
 }
-static int ch_ncyc(const sdr_rcv_t *rcv, const sdr_ch_t *ch)
+static int ch_ncyc(const sdr_ch_th_t *th)
 {
-    int k = ch->rf_ch;
-    return k < SDR_MAX_RFCH && rcv->buffd[k] ? rcv->N / rcv->dec[k] : rcv->N;
+    return th->sub >= 0 ? th->rcv->N / th->rcv->sub_D[th->sub] : th->rcv->N;
 }
 
 // update SDR receiver CH for an epoch -----------------------------------------
 static void ch_th_update(sdr_ch_th_t *th)
 {
     sdr_ch_t *ch = th->ch;
-    int nc = ch_ncyc(th->rcv, ch);
+    int nc = ch_ncyc(th);
     
-    sdr_ch_update(ch, th->ix * SDR_CYC, ch_buff(th->rcv, ch),
+    sdr_ch_update(ch, th->ix * SDR_CYC, ch_buff(th),
         nc * (int)(th->ix % MAX_BUFF));
     ch_th_udpvt(th);
     th->ix += ch->N / nc;
@@ -599,10 +597,10 @@ static void *ch_thread(void *arg)
 {
     sdr_ch_th_t *th = (sdr_ch_th_t *)arg;
     sdr_ch_t *ch = th->ch;
-    int n = ch->N / ch_ncyc(th->rcv, ch);
+    int n = ch->N / ch_ncyc(th);
     
     while (th->state) {
-        int64_t ix = get_buff_ix_ch(th->rcv, ch->rf_ch);
+        int64_t ix = get_buff_ix_ch(th->rcv, th->sub);
         while (th->ix + 2 * n <= ix && th->state) {
             sdr_mutex_lock(&th->mtx);
             if (th->batch && ch->state == SDR_STATE_LOCK) {
@@ -642,10 +640,10 @@ static void *grp_thread(void *arg)
     
     if (*rcv->cpu_trk) sdr_thread_affinity(rcv->cpu_trk);
     while (g->state) {
-        int64_t ix = get_buff_ix_ch(rcv, g->rf_ch);
+        int64_t ix = get_buff_ix_ch(rcv, g->th[0]->sub);
         for ( ; g->ix + 2 * g->n <= ix && g->state; g->ix += g->n) {
-            const sdr_buff_t *buff = ch_buff(rcv, g->th[0]->ch);
-            int njob = 0, ib = ch_ncyc(rcv, g->th[0]->ch) * (int)(g->ix % MAX_BUFF);
+            const sdr_buff_t *buff = ch_buff(g->th[0]);
+            int njob = 0, ib = ch_ncyc(g->th[0]) * (int)(g->ix % MAX_BUFF);
             
             for (int i = 0; i < g->nth; i++) {
                 sdr_ch_th_t *th = g->th[i];
@@ -689,10 +687,11 @@ static void grp_th_start(sdr_rcv_t *rcv)
     rcv->ngrp = 0;
     for (int i = 0; i < rcv->nch; i++) {
         sdr_ch_th_t *th = rcv->th[i];
-        int n = th->ch->N / ch_ncyc(rcv, th->ch), j;
+        int n = th->ch->N / ch_ncyc(th), j;
         for (j = 0; j < rcv->ngrp; j++) {
             grp_th_t *g = (grp_th_t *)rcv->grp[j];
-            if (g->rf_ch == th->ch->rf_ch && g->n == n) break;
+            if (g->rf_ch == th->ch->rf_ch && g->th[0]->sub == th->sub &&
+                g->n == n) break;
         }
         if (j >= rcv->ngrp) {
             grp_th_t *g = (grp_th_t *)sdr_malloc(sizeof(grp_th_t));
@@ -845,9 +844,11 @@ static void set_srch_ch(sdr_rcv_t *rcv, const char *opt)
 //                     -CPU_TRK=<cpus>: CPUs of tracking (e.g. 4-7)
 //                     -RCV_PRIO=<prio>: real-time priority (SCHED_RR) of IF
 //                         input thread (1-99, 0: not changed)
-//                     -DEC=<rfch>:<D>[,<rfch>:<D>...]: decimate the IF data of
-//                         RF CH by D (2,3,4) with FIR lowpass for the CHs of the
-//                         RF CH (search and tracking at fs/D, narrowband signals)
+//                     -DEC=<rfch>:<D>[:<foff>][,...]: decimated sub-band of RF
+//                         CH by D (2,3,4) with FIR lowpass (foff: 0) or
+//                         bandpass centered at foff (MHz) for the CHs of the RF
+//                         CH in the passband (search and tracking at fs/D,
+//                         IF frequency f mod fs/D, narrowband signals)
 //
 //  returns:
 //      SDR receiver (NULL: error)
@@ -887,17 +888,20 @@ sdr_rcv_t *sdr_rcv_new(const char **sigs, const int *prns, int n, int fmt,
             fmt == SDR_FMT_CS8) ? 8 : (fmt == SDR_FMT_CS16 ? 16 : bits[i]);
     }
     rcv->N = (int)(SDR_CYC * fs);
-    if ((p = strstr(opt, "-DEC="))) { // decimation of RF CHs
-        int ch, d, k = 0;
-        p += 5;
-        while (sscanf(p, "%d:%d%n", &ch, &d, &k) >= 2) {
+    if ((p = strstr(opt, "-DEC="))) { // decimated sub-bands of RF CHs
+        for (p += 5; rcv->nsub < SDR_MAX_SUB; p++) {
+            int ch, d, k = 0;
+            double foff = 0.0;
+            if (sscanf(p, "%d:%d%n", &ch, &d, &k) < 2) break;
+            p += k;
+            if (*p == ':' && sscanf(p + 1, "%lf%n", &foff, &k) >= 1) p += 1 + k;
             if (ch >= 1 && ch <= rcv->nrfch && d >= 2 && d <= 4 &&
                 rcv->N % d == 0 && rcv->rfch[ch-1].IQ == 2) {
-                rcv->dec[ch-1] = d;
+                rcv->sub_rf[rcv->nsub] = ch - 1;
+                rcv->sub_D[rcv->nsub] = d;
+                rcv->sub_foff[rcv->nsub++] = foff * 1e6;
             }
-            p += k;
             if (*p != ',') break;
-            p++;
         }
     }
     
@@ -910,8 +914,21 @@ sdr_rcv_t *sdr_rcv_new(const char **sigs, const int *prns, int n, int fmt,
             if (rtoc_of(rcv, ch[j])) fi[j] -= fs * 0.25; // fs/4 shift
         }
         for (int j = 0; j < nch && rcv->nch < SDR_MAX_NCH; j++) {
-            int d = ch[j] < rcv->nrfch && rcv->dec[ch[j]] > 1 ? rcv->dec[ch[j]] : 1;
-            sdr_ch_th_t *th = ch_th_new(sigs[i], prns[i], fi[j], fs / d, rcv);
+            // decimated sub-band with the IF frequency in the passband
+            int sub = -1;
+            for (int k = 0; k < rcv->nsub; k++) {
+                if (rcv->sub_rf[k] != ch[j] || fabs(fi[j] - rcv->sub_foff[k]) >
+                    0.45 * fs / rcv->sub_D[k]) continue;
+                if (sub < 0 || fabs(fi[j] - rcv->sub_foff[k]) <
+                    fabs(fi[j] - rcv->sub_foff[sub])) sub = k;
+            }
+            double fs_ch = fs, fi_ch = fi[j];
+            if (sub >= 0) { // IF frequency f mod fs/D in [-fs/2D, fs/2D)
+                fs_ch = fs / rcv->sub_D[sub];
+                fi_ch = fi[j] - floor(fi[j] / fs_ch + 0.5) * fs_ch;
+            }
+            sdr_ch_th_t *th = ch_th_new(sigs[i], prns[i], fi_ch, fs_ch, rcv);
+            if (th) th->sub = sub;
             if (th) {
                 th->ch->no = rcv->nch + 1;
                 th->ch->rf_ch = ch[j];
@@ -929,10 +946,9 @@ sdr_rcv_t *sdr_rcv_new(const char **sigs, const int *prns, int n, int fmt,
     for (int i = 0; i < nrfch; i++) {
         rcv->buff[i] = sdr_buff_new(rcv->N * MAX_BUFF, 2); // IQ
     }
-    for (int i = 0; i < rcv->nrfch; i++) { // decimated buffers and decimators
-        if (rcv->dec[i] <= 1) continue;
-        rcv->buffd[i] = sdr_buff_new(rcv->N / rcv->dec[i] * MAX_BUFF, 2);
-        rcv->decf[i] = sdr_dec_new(rcv->dec[i], 0, 0.0, fs);
+    for (int i = 0; i < rcv->nsub; i++) { // decimated buffers and decimators
+        rcv->buffd[i] = sdr_buff_new(rcv->N / rcv->sub_D[i] * MAX_BUFF, 2);
+        rcv->decf[i] = sdr_dec_new(rcv->sub_D[i], 0, 0.0, rcv->sub_foff[i], fs);
     }
     rcv->ich = -1;
     snprintf(rcv->opt, sizeof(rcv->opt), "%s", opt);
@@ -969,7 +985,7 @@ void sdr_rcv_free(sdr_rcv_t *rcv)
     for (int i = 0; i < rcv->nrfch + rcv_narch(rcv); i++) {
         sdr_buff_free(rcv->buff[i]);
     }
-    for (int i = 0; i < SDR_MAX_RFCH; i++) {
+    for (int i = 0; i < rcv->nsub; i++) {
         sdr_buff_free(rcv->buffd[i]);
         sdr_dec_free(rcv->decf[i]);
     }
@@ -1503,31 +1519,43 @@ static void update_srch_ch(sdr_rcv_t *rcv)
     }
 }
 
-// decimation thread of RF CH -------------------------------------------------
+// decimation thread of sub-band ----------------------------------------------
 //   (decimates the IF data cycles written by the IF input thread, up to the
-//   cycle before the last written one, in parallel with the input thread)
+//   cycle before the last written one, in parallel with the input thread; the
+//   output is written earlier by the group delay of the FIR, so that the cycle
+//   dx is complete after the cycle dx + 1 is decimated)
 typedef struct {sdr_rcv_t *rcv; int k;} dec_arg_t;
 
 static void *dec_thread(void *arg)
 {
     sdr_rcv_t *rcv = ((dec_arg_t *)arg)->rcv;
-    int k = ((dec_arg_t *)arg)->k, nd = rcv->N / rcv->dec[k];
+    int k = ((dec_arg_t *)arg)->k, rf = rcv->sub_rf[k];
+    int nd = rcv->N / rcv->sub_D[k], nb = nd * MAX_BUFF;
+    int dly = sdr_dec_delay(rcv->decf[k]);
+    sdr_cpx8_t *out = (sdr_cpx8_t *)sdr_malloc(nd);
+    int64_t dx = -1;
     
     while (rcv->state) {
-        int64_t ix = get_buff_ix(rcv), dx = rcv->dec_ix[k];
+        int64_t ix = get_buff_ix(rcv);
         if (dx + 1 >= ix) {
             sdr_sleep_msec(1);
             continue;
         }
         for (dx++; dx < ix && rcv->state; dx++) {
-            sdr_dec_apply(rcv->decf[k], rcv->buff[k]->data + rcv->N *
-                (int)(dx % MAX_BUFF), rcv->N, rcv->buffd[k]->data + nd *
-                (int)(dx % MAX_BUFF));
+            sdr_dec_apply(rcv->decf[k], rcv->buff[rf]->data + rcv->N *
+                (int)(dx % MAX_BUFF), rcv->N, out);
+            int64_t q = (dx * nd - dly) % nb; // compensate group delay
+            if (q < 0) q += nb;
+            for (int i = 0; i < nd; i++) {
+                rcv->buffd[k]->data[(q + i) % nb] = out[i];
+            }
             sdr_mutex_lock(&rcv->mtx);
-            rcv->dec_ix[k] = dx;
+            rcv->dec_ix[k] = dx - 1;
             sdr_mutex_unlock(&rcv->mtx);
         }
+        dx--;
     }
+    sdr_free(out);
     return NULL;
 }
 
@@ -1558,10 +1586,9 @@ static void *rcv_thread(void *arg)
     rcv->stats.sum = 0.0;
     
     // decimation threads (inherit the CPU affinity and the priority)
-    static dec_arg_t dec_args[SDR_MAX_RFCH];
-    for (int k = 0; k < SDR_MAX_RFCH; k++) {
-        if (!rcv->decf[k]) continue;
-        rcv->dec_ix[k] = -1;
+    static dec_arg_t dec_args[SDR_MAX_SUB];
+    for (int k = 0; k < rcv->nsub; k++) {
+        rcv->dec_ix[k] = -2;
         dec_args[k].rcv = rcv;
         dec_args[k].k = k;
         if (!sdr_thread_create(&rcv->dec_th[k], dec_thread, dec_args + k)) {
@@ -1611,8 +1638,8 @@ static void *rcv_thread(void *arg)
     } else if (rcv->dev == SDR_DEV_SOAPY) {
         sdr_sdev_stop((sdr_sdev_t *)rcv->dp);
     }
-    for (int k = 0; k < SDR_MAX_RFCH; k++) { // (rcv->state = 0)
-        if (rcv->decf[k]) sdr_thread_join(rcv->dec_th[k]);
+    for (int k = 0; k < rcv->nsub; k++) { // (rcv->state = 0)
+        sdr_thread_join(rcv->dec_th[k]);
     }
     sdr_free(raw);
     return NULL;

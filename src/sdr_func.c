@@ -69,7 +69,8 @@
 //                   in mix_carr_p() (-DMIX_LUT_SCALAR: LUT of 256 phases)
 //                   (AVX2: LUT; 64 phases by vpshufb not faster on x86,
 //                   evaluated in commit 9c1e219 of the npu-acceleration branch)
-//                   add API sdr_dec_new(), sdr_dec_free(), sdr_dec_apply()
+//                   add API sdr_dec_new(), sdr_dec_free(), sdr_dec_apply(),
+//                   sdr_dec_delay()
 //
 #include <math.h>
 #include <stdarg.h>
@@ -121,9 +122,11 @@ struct sdr_lpf_tag {              // LPF state struct
 #define DEC_RMS_OUT   3.0   // target RMS of decimator output (4-bit I/Q)
 
 struct sdr_dec_tag {              // decimator (polyphase FIR) state struct
-    int D, ntap;                  // decimation factor and number of taps
-    float h[DEC_MAX_TAP];         // FIR coefficients (DC gain 1)
+    int D, ntap, cpx;             // decimation factor, number of taps, complex
+    float h[DEC_MAX_TAP];         // FIR coefficients (real part, gain 1)
+    float hi[DEC_MAX_TAP];        // FIR coefficients (imaginary part)
     int16_t hq[DEC_MAX_TAP];      // coefficients scaled by gain (Q14)
+    int16_t hiq[DEC_MAX_TAP];     // imaginary part scaled by gain (Q14)
     sdr_cpx8_t hist[DEC_MAX_TAP]; // input history (ntap - 1 samples)
     double pwr;                   // mean power of FIR output (gain 1)
     float gain;                   // output gain
@@ -523,20 +526,24 @@ void sdr_lpf_apply(sdr_lpf_t *lpf, sdr_cpx8_t *data, int N)
 }
 
 //------------------------------------------------------------------------------
-//  Create a new decimator (polyphase FIR lowpass and decimation by D) for cpx8
-//  samples. The output is requantized to 4-bit I/Q with a gain adjusted to
-//  keep the output RMS at ~3 (mean power of the FIR output).
+//  Create a new decimator (polyphase FIR lowpass or bandpass and decimation by
+//  D) for cpx8 samples. With foff != 0, the passband is centered at foff (FIR
+//  taps h[k] exp(-j 2 pi foff (k - H/2) / fs), H = ntap - 1) and a signal at
+//  frequency f appears at f mod fs/D in the output. The output is requantized
+//  to 4-bit I/Q with a gain adjusted to keep the output RMS at ~3 (mean power
+//  of the FIR output).
 //
 //  args:
 //      D        (I)  decimation factor (2, 3 or 4)
 //      ntap     (I)  number of taps (<= 64, 0: 12 * D + 1)
 //      fc       (I)  cutoff frequency (Hz) (0: 0.45 * fs / D)
+//      foff     (I)  center frequency of the passband (Hz) (0: lowpass)
 //      fs       (I)  input sampling frequency (Hz)
 //
 //  return:
 //      decimator (NULL: error)
 //
-sdr_dec_t *sdr_dec_new(int D, int ntap, double fc, double fs)
+sdr_dec_t *sdr_dec_new(int D, int ntap, double fc, double foff, double fs)
 {
     if (D < 2 || D > 4 || fs <= 0.0) return NULL;
     if (ntap <= 0) ntap = 12 * D + 1;
@@ -554,6 +561,15 @@ sdr_dec_t *sdr_dec_new(int D, int ntap, double fc, double fs)
     }
     for (int i = 0; i < ntap; i++) dec->h[i] = (float)(h[i] / sum);
     for (int i = 0; i < ntap / 2; i++) dec->h[ntap-1-i] = dec->h[i]; // symmetric
+    dec->cpx = foff != 0.0;
+    if (dec->cpx) { // real part symmetric, imaginary part antisymmetric
+        for (int i = 0; i <= (ntap - 1) / 2; i++) {
+            double th = 2.0 * PI * foff * (i - (ntap - 1) / 2.0) / fs, v = dec->h[i];
+            dec->h[i] = dec->h[ntap-1-i] = (float)(v * cos(th));
+            dec->hi[i] = (float)(-v * sin(th));
+            dec->hi[ntap-1-i] = -dec->hi[i];
+        }
+    }
     dec->D = D;
     dec->ntap = ntap;
     dec->pwr = 0.0;
@@ -578,13 +594,34 @@ void sdr_dec_free(sdr_dec_t *dec)
     sdr_free(dec);
 }
 
+//------------------------------------------------------------------------------
+//  Get group delay of a decimator (output samples). The output sample m of
+//  a call corresponds to the input sample D * (m - delay) of the call.
+//
+//  args:
+//      dec      (I)  decimator
+//
+//  return:
+//      group delay (output samples) ((ntap - 1) / 2 / D, 12 * D + 1 taps: 6)
+//
+int sdr_dec_delay(const sdr_dec_t *dec)
+{
+    return (dec->ntap - 1) / 2 / dec->D;
+}
+
 // set coefficients scaled by gain (Q14) ---------------------------------------
+static int16_t dec_q14(float v)
+{
+    v *= 1 << DEC_H_SHIFT;
+    return (int16_t)(v > 32767.0f ? 32767 : (v < -32768.0f ? -32768 : lrintf(v)));
+}
+
 static void dec_set_gain(sdr_dec_t *dec, float gain)
 {
     dec->gain = gain;
     for (int i = 0; i < dec->ntap; i++) {
-        float v = dec->h[i] * gain * (1 << DEC_H_SHIFT);
-        dec->hq[i] = (int16_t)(v > 32767.0f ? 32767 : (v < -32768.0f ? -32768 : lrintf(v)));
+        dec->hq[i] = dec_q14(dec->h[i] * gain);
+        dec->hiq[i] = dec_q14(dec->hi[i] * gain);
     }
 }
 
@@ -651,8 +688,8 @@ void sdr_dec_apply(sdr_dec_t *dec, const sdr_cpx8_t *in, int N, sdr_cpx8_t *out)
         for (int m = 0; m < nout; m++) {
             float yI = 0.0f, yQ = 0.0f;
             for (int k = 0; k <= H; k++) {
-                yI += dec->h[k] * xI[off[k] + m];
-                yQ += dec->h[k] * xQ[off[k] + m];
+                yI += dec->h[k] * xI[off[k] + m] - dec->hi[k] * xQ[off[k] + m];
+                yQ += dec->h[k] * xQ[off[k] + m] + dec->hi[k] * xI[off[k] + m];
             }
             p += yI * yI + yQ * yQ;
         }
@@ -670,15 +707,25 @@ void sdr_dec_apply(sdr_dec_t *dec, const sdr_cpx8_t *in, int N, sdr_cpx8_t *out)
         for (int k = 0; k <= H / 2; k++) { // symmetric taps h[k] = h[H-k]
             int o = off[k] + m, o2 = off[H-k] + m;
             int16x8_t vI = vld1q_s16(xI + o), vQ = vld1q_s16(xQ + o);
+            int16x8_t wI = vld1q_s16(xI + o2), wQ = vld1q_s16(xQ + o2);
+            int16x8_t sI = vI, sQ = vQ;
             if (k < H - k) {
-                vI = vaddq_s16(vI, vld1q_s16(xI + o2));
-                vQ = vaddq_s16(vQ, vld1q_s16(xQ + o2));
+                sI = vaddq_s16(vI, wI);
+                sQ = vaddq_s16(vQ, wQ);
             }
             int16x4_t hk = vdup_n_s16(dec->hq[k]);
-            aI0 = vmlal_s16(aI0, vget_low_s16(vI), hk);
-            aI1 = vmlal_s16(aI1, vget_high_s16(vI), hk);
-            aQ0 = vmlal_s16(aQ0, vget_low_s16(vQ), hk);
-            aQ1 = vmlal_s16(aQ1, vget_high_s16(vQ), hk);
+            aI0 = vmlal_s16(aI0, vget_low_s16(sI), hk);
+            aI1 = vmlal_s16(aI1, vget_high_s16(sI), hk);
+            aQ0 = vmlal_s16(aQ0, vget_low_s16(sQ), hk);
+            aQ1 = vmlal_s16(aQ1, vget_high_s16(sQ), hk);
+            if (dec->cpx && k < H - k) { // antisymmetric imaginary taps
+                int16x8_t dI = vsubq_s16(vI, wI), dQ = vsubq_s16(vQ, wQ);
+                int16x4_t gk = vdup_n_s16(dec->hiq[k]);
+                aI0 = vmlsl_s16(aI0, vget_low_s16(dQ), gk);
+                aI1 = vmlsl_s16(aI1, vget_high_s16(dQ), gk);
+                aQ0 = vmlal_s16(aQ0, vget_low_s16(dI), gk);
+                aQ1 = vmlal_s16(aQ1, vget_high_s16(dI), gk);
+            }
         }
         int16x8_t yI = vcombine_s16(vshrn_n_s32(aI0, DEC_H_SHIFT), vshrn_n_s32(aI1, DEC_H_SHIFT));
         int16x8_t yQ = vcombine_s16(vshrn_n_s32(aQ0, DEC_H_SHIFT), vshrn_n_s32(aQ1, DEC_H_SHIFT));
@@ -698,8 +745,8 @@ void sdr_dec_apply(sdr_dec_t *dec, const sdr_cpx8_t *in, int N, sdr_cpx8_t *out)
     for ( ; m < nout; m++) {
         int32_t aI = rnd, aQ = rnd;
         for (int k = 0; k <= H; k++) {
-            aI += dec->hq[k] * xI[off[k] + m];
-            aQ += dec->hq[k] * xQ[off[k] + m];
+            aI += dec->hq[k] * xI[off[k] + m] - dec->hiq[k] * xQ[off[k] + m];
+            aQ += dec->hq[k] * xQ[off[k] + m] + dec->hiq[k] * xI[off[k] + m];
         }
         int yI = aI >> DEC_H_SHIFT, yQ = aQ >> DEC_H_SHIFT;
         acc2 += yI * yI + yQ * yQ;

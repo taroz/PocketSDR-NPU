@@ -313,7 +313,7 @@ pocket_trk [-sig sig -prn prn[,...] [-rfch ch[,...]] ...]
            [-driver name] [-gain gain] [-bw bw] [-fd dopp]
            [-log path] [-nmea path] [-rtcm path] [-raw path] ...
            [-arch nch] [-geom file] [-acc backend] [-tacc backend]
-           [-cpu_acq cpus] [-cpu_trk cpus] [-rcv_prio prio] [-dec rfch:D[,...]]
+           [-cpu_acq cpus] [-cpu_trk cpus] [-rcv_prio prio] [-dec rfch:D[:foff][,...]]
            [-h height] [-opt file] [-debug file] [-v] [file]
 ```
 
@@ -399,14 +399,18 @@ The input can be a local file, a TCP stream, a Pocket SDR FE device, or a SoapyS
     reads and unpacks the IF data, switches the search channel and updates
     the PVT every cycle, to keep it from waiting for the CPU under a high
     tracking load (Linux, needs root or CAP_SYS_NICE/rtprio). [not changed]
-- `-dec rfch:D[,...]`
-  - Decimate the IF data of the RF CH(s) (IQ sampling) by D (2, 3 or 4) by a
-    polyphase FIR lowpass (12 x D + 1 taps, Blackman window, cutoff 0.9 x
-    fs/(2D), output requantized to 4-bit I/Q with an adaptive gain) for the
-    search and tracking of the
-    signals of the RF CH at fs/D. For the RF CHs of narrowband signals only
-    (e.g. L1CA, B1I, G1CA, L2CM; the tracking cost per channel is roughly
-    proportional to the sampling rate). [none]
+- `-dec rfch:D[:foff][,...]`
+  - Decimated sub-band of the RF CH (IQ sampling) by D (2, 3 or 4): a polyphase
+    FIR (12 x D + 1 taps, Blackman window, cutoff 0.9 x fs/(2D)), lowpass or
+    bandpass centered at `foff` (MHz, complex taps), the output requantized to
+    4-bit I/Q with an adaptive gain and the group delay compensated. The CHs
+    of the signals of the RF CH in the passband are searched and tracked at
+    fs/D (IF frequency f mod fs/D). Several sub-bands of an RF CH can be
+    given (e.g. `-dec 1:3:7.42,1:3:-6.902,2:3` for `pocket_L1L2L5E5b_24MHz.conf`:
+    L1/E1/B1C and B1I of the RF CH 1 centered at 1568 MHz, L2C of the RF CH 2).
+    For the RF CHs of narrowband signals with many channels (the tracking
+    cost per channel is roughly proportional to the sampling rate; a
+    decimator costs ~14% of a core at 16 MHz). [none]
 - `-h height`
   - Console height (rows) for the runtime status display. [`64`]
 - `-opt file`

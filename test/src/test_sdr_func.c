@@ -741,15 +741,15 @@ static double tone_pwr(const sdr_cpx8_t *x, int n, double f, double fs)
 static void test_sdr_dec_api(void)
 {
     static sdr_cpx8_t in[24000], out[12000];
-    TEST_ASSERT_TRUE(sdr_dec_new(1, 0, 0.0, 16e6) == NULL);
-    TEST_ASSERT_TRUE(sdr_dec_new(5, 0, 0.0, 16e6) == NULL);
+    TEST_ASSERT_TRUE(sdr_dec_new(1, 0, 0.0, 0.0, 16e6) == NULL);
+    TEST_ASSERT_TRUE(sdr_dec_new(5, 0, 0.0, 0.0, 16e6) == NULL);
     sdr_dec_free(NULL);
     double fss[] = {16e6, 24e6};
     int Ds[] = {2, 3};
     for (int t = 0; t < 2; t++) {
         double fs = fss[t], fo = fs / Ds[t], fa = fo + 1.5e6, pin = 0.0, pal = 0.0;
         int N = (int)(fs * 1e-3), D = Ds[t];
-        sdr_dec_t *dec = sdr_dec_new(D, 0, 0.0, fs);
+        sdr_dec_t *dec = sdr_dec_new(D, 0, 0.0, 0.0, fs);
         TEST_ASSERT_TRUE(dec != NULL);
         for (int blk = 0; blk < 6; blk++) {
             double f = blk < 3 ? 1e6 : fa;
@@ -770,6 +770,34 @@ static void test_sdr_dec_api(void)
         fflush(stdout);
         TEST_ASSERT_TRUE(pin > 1.0);                       // passband tone kept
         TEST_ASSERT_TRUE(10.0 * log10(pal / pin) < -30.0); // alias < -30 dB
+        TEST_ASSERT_EQ_INT(6, sdr_dec_delay(dec));
+        sdr_dec_free(dec);
+    }
+    // bandpass (sub-band at foff = +7.42 MHz of 24 MHz, D = 3): a tone at
+    // foff + 0.5 MHz kept at (foff + 0.5 MHz) mod 8 MHz, a tone at -6.9 MHz
+    // (other sub-band, same amplitude) attenuated
+    {
+        double fs = 24e6, fo = 8e6, foff = 7.42e6, f1 = foff + 0.5e6, f2 = -6.9e6;
+        double pin = 0.0, pal = 0.0, a1 = f1 - floor(f1 / fo + 0.5) * fo;
+        double a2 = f2 - floor(f2 / fo + 0.5) * fo;
+        int N = 24000, D = 3;
+        sdr_dec_t *dec = sdr_dec_new(D, 0, 0.0, foff, fs);
+        TEST_ASSERT_TRUE(dec != NULL);
+        for (int blk = 0; blk < 6; blk++) {
+            double f = blk < 3 ? f1 : f2;
+            for (int i = 0; i < N; i++) {
+                double ph = 2.0 * PI * f * (blk * N + i) / fs;
+                in[i] = SDR_CPX8((int)lrint(3.0 * cos(ph)), (int)lrint(3.0 * sin(ph)));
+            }
+            sdr_dec_apply(dec, in, N, out);
+            if (blk == 2) pin = tone_pwr(out, N / D, a1, fo);
+            if (blk == 5) pal = tone_pwr(out, N / D, a2, fo);
+        }
+        printf("[bandpass foff=7.42MHz pass=%.2f other=%.1f dB] ", pin,
+            10.0 * log10(pal / pin + 1e-12));
+        fflush(stdout);
+        TEST_ASSERT_TRUE(pin > 1.0);
+        TEST_ASSERT_TRUE(10.0 * log10(pal / pin + 1e-12) < -30.0);
         sdr_dec_free(dec);
     }
 }

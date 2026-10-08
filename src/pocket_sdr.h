@@ -60,6 +60,7 @@ extern "C" {
 #define SDR_MAX_NPRN   256      // max number of PRNs
 #define SDR_MAX_NCH    1500     // max number of receiver channels
 #define SDR_CPU_ALL    "0-63"   // CPU list of all CPUs (sdr_thread_affinity())
+#define SDR_MAX_SUB    16       // max number of decimated sub-bands
 #define SDR_MAX_NSYM   2000     // max number of symbols
 #define SDR_MAX_DATA   4096     // max length of navigation data
 #define SDR_N_CORRX    101      // number of additional correlators
@@ -321,6 +322,7 @@ typedef struct {                // SDR receiver channel thread type
     struct sdr_rcv_tag *rcv;    // pointer to SDR receiver
     sdr_thread_t thread;        // SDR receiver channel thread
     int batch;                  // tracked by batched correlator group (0/1)
+    int sub;                    // decimated sub-band (-1: none)
     int cpu;                    // CPU affinity set (0:none,1:acq,2:trk)
     sdr_mutex_t mtx;            // lock of channel update (batched correlator)
 } sdr_ch_th_t;
@@ -432,11 +434,14 @@ typedef struct sdr_rcv_tag {    // SDR receiver type
     char cpu_acq[64];           // CPUs of acquisition (option -CPU_ACQ)
     char cpu_trk[64];           // CPUs of tracking (option -CPU_TRK)
     int rcv_prio;               // real-time priority of IF input thread (0:off)
-    int dec[SDR_MAX_RFCH];      // decimation factor of RF CH (option -DEC, 0,1: off)
-    sdr_buff_t *buffd[SDR_MAX_RFCH]; // decimated IF data buffers (NULL: off)
-    sdr_dec_t *decf[SDR_MAX_RFCH]; // decimators of RF CHs (NULL: off)
-    int64_t dec_ix[SDR_MAX_RFCH]; // last decimated IF data cycle (cyc)
-    sdr_thread_t dec_th[SDR_MAX_RFCH]; // decimation threads
+    int nsub;                   // number of decimated sub-bands (option -DEC)
+    int sub_rf[SDR_MAX_SUB];    // RF CH of sub-band
+    int sub_D[SDR_MAX_SUB];     // decimation factor of sub-band
+    double sub_foff[SDR_MAX_SUB]; // center frequency of sub-band (Hz)
+    sdr_buff_t *buffd[SDR_MAX_SUB]; // decimated IF data buffers
+    sdr_dec_t *decf[SDR_MAX_SUB]; // decimators
+    int64_t dec_ix[SDR_MAX_SUB]; // last decimated IF data cycle (cyc)
+    sdr_thread_t dec_th[SDR_MAX_SUB]; // decimation threads
     int ngrp;                   // number of batched correlator groups
     void *grp[SDR_MAX_NCH];     // batched correlator groups
     sdr_thread_t thread;        // SDR receiver thread
@@ -571,7 +576,8 @@ int sdr_gen_fftw_wisdom(const char *file, int N);
 sdr_lpf_t *sdr_lpf_new(double fc, double fs);
 void sdr_lpf_free(sdr_lpf_t *lpf);
 void sdr_lpf_apply(sdr_lpf_t *lpf, sdr_cpx8_t *data, int N);
-sdr_dec_t *sdr_dec_new(int D, int ntap, double fc, double fs);
+sdr_dec_t *sdr_dec_new(int D, int ntap, double fc, double foff, double fs);
+int sdr_dec_delay(const sdr_dec_t *dec);
 void sdr_dec_free(sdr_dec_t *dec);
 void sdr_dec_apply(sdr_dec_t *dec, const sdr_cpx8_t *in, int N, sdr_cpx8_t *out);
 
