@@ -1,7 +1,7 @@
 //
 //  Tracking benchmark and regression on recorded IF data.
 //
-//  usage: bench_sdr_trk [-fmt RAW32|INT8X2] [-f fs_MHz] [-fo f1,f2,...]
+//  usage: bench_sdr_trk [-fmt RAW32|RAW16|INT8X2] [-f fs_MHz] [-fo f1,f2,...]
 //             [-toff s] [-tlen s] [-acc backend] [-tacc backend] [-batch]
 //             [-nposx n] [-sp_corr chip] [-o out_file] -sig sig -prn prns
 //             -rfch ch [-sig ...] file
@@ -138,7 +138,8 @@ int main(int argc, char **argv)
     for (int i = 1; i < argc; i++) {
         if (!strcmp(argv[i], "-fmt") && i + 1 < argc) {
             i++;
-            fmt = !strcmp(argv[i], "INT8X2") ? SDR_FMT_INT8X2 : SDR_FMT_RAW32;
+            fmt = !strcmp(argv[i], "INT8X2") ? SDR_FMT_INT8X2 :
+                (!strcmp(argv[i], "RAW16") ? SDR_FMT_RAW16 : SDR_FMT_RAW32);
         } else if (!strcmp(argv[i], "-f") && i + 1 < argc) {
             fs = atof(argv[++i]) * 1e6;
         } else if (!strcmp(argv[i], "-fo") && i + 1 < argc) {
