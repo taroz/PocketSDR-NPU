@@ -1263,3 +1263,146 @@ The capacity rises from ~217-230 to > 285 channels (the limit is estimated at
   `_f` (13.13): vs FFTW on the A76 1.4x (L1CA) / 2.4x (E1B) / 3x (long codes)
   faster.
 - Open: 24 MHz data and a live Pocket SDR FE, ROCK 5C.
+
+## 14. 24 MHz Evaluation (Pocket SDR FE 4CH, Live Sky)
+
+### 14.1 Data and setup
+
+- Pocket SDR FE 4CH (FX3, USB 3.0) on the ROCK 5B, rooftop open-sky antenna,
+  `conf/pocket_L1L2L5E5b_24MHz.conf`: CH1 L1 + B1 (LO 1568 MHz, IF filter
+  16.4 MHz: L1/E1/B1C at +7.42 MHz, B1I at -6.902 MHz), CH2 L2 (4.2 MHz),
+  CH3 L5 (16.4 MHz), CH4 E5b (16.4 MHz), 24 MHz IQ, 2 bits, RAW16
+  (48 MB/s). Recorded by `pocket_dump -t 600 -r` (600 s, 28.8 GB) directly to
+  the NAS (2026-10-09 06:35 UTC), right after a power cycle of the FE, block
+  order checked (14.6). The earlier recording (2026-10-08 05:41 UTC) had the
+  16 KB block misorder of 14.6 and is not used; the results of 14.2 and 14.5
+  were measured again with the new data.
+- Position 35.6885 N, 140.0202 E (PVT of GPS + Galileo + BeiDou + QZSS +
+  IRNSS + SBAS). The PVT failures with SBAS seen with the old data were caused
+  by the block misorder (with the new data all epochs FIX with 9 SBAS
+  satellites tracked).
+- Benches: `bench_sdr_acq` / `bench_sdr_trk -fmt RAW16 -f 24`, `bench_acq.sh`
+  with `FMT=RAW16 FS=24`. RKNN models for 24 MHz: 48000:7, 192000:27,
+  480000:23:313, 960000:17 and Kc = 1 (`_s` and `_f`); FFTW wisdom of 48000,
+  192000, 480000, 960000.
+
+### 14.2 Visible signals
+
+Two-stage calibration (600 s, rknn): (1) L1CA (GPS, QZSS, SBAS), E1B, B1I,
+I5S: GPS 16, 25, 26, 28, 29, 31, 32, SBAS 122, 128-130, 134, 137, 142-144,
+Galileo 2, 3, 7, 8, 18, 25, 30, 32, BeiDou 1-4, 6-11, 14, 19, 21, 22, 27,
+29, 30, 36, 39, 56, IRNSS 3, 5, 7, 10 (+ QZSS 193-202); (2) all signals of
+these satellites in the 4 RF CHs: 204 signals found, 189 locked at the end
+(L1CA 20, B1I 20, L5I 15, L2CM 10, B1CD, B1CP, E1B/C, E5aI/Q, E5bI/Q 8 each,
+B2AD, B2bI, L1CD, L1CP 7 each, B2AP, L5Q 6 each, I5S, L1S, L5SI/Q 4 each,
+B2I 2, I1SD/P 1). The old data with the block misorder gave only 131 locked
+signals with the C/N0 3-5 dB lower (half of the signal energy at the
+displaced code phase).
+
+### 14.3 Acquisition
+
+Time / CPU time per search (ms), 27 signals (strongest, weakest and one not
+found PRN of L1CA, E1B, B1I, L5I, E5aI, B2aD, I5S, E5bI, B2bI), all PASS vs
+the PocketFFT reference (same detections, max diff C/N0 0.1 dB, code 0):
+
+| backend | L1CA A76 | E1B A76 | L1CA A55 | E1B A55 |
+|---|---|---|---|---|
+| PocketFFT `cpu` | 697 / 697 | 3392 / 3376 | - | - |
+| FFTW `cpu` | 380 / 380 | 2459 / 2443 | 1809 / 1809 | 9880 / 9864 |
+| FFTW `cpu_opt` (shared DFT) | 203 / 203 | 1185 / 1169 | 952 / 952 | 5303 / 5287 |
+| rknn `_f` (`noshift`) | 273 / 50 | 1635 / 241 | - | - |
+| rknn `_s` (default) | **186 / 48** | **922 / 215** | **263 / 153** | **1199 / 569** |
+
+Direct search of long codes (4 GPS PRNs, L1CP 201 bins, L2CM 401 bins):
+
+| backend | L1CP A76 | L2CM A76 | L1CP A55 | L2CM A55 |
+|---|---|---|---|---|
+| FFTW `cpu` | 7375 / 7357 | 16014 / 15995 | 31104 / 31084 | 66059 / 66036 |
+| rknn `_s` | **2876 / 509** | **6104 / 1135** | **3551 / 1294** | **7489 / 2673** |
+
+- Against the best CPU search (FFTW `cpu_opt`) the NPU is 1.09x (L1CA) /
+  1.29x (E1B) faster on the A76 with 1/4-1/5.5 of the CPU time, and 3.6x /
+  4.4x faster on the A55 with 1/6-1/9 of the CPU time; at 16 MHz the A76 E1B
+  ratio was 1.07x, so the advantage grows with the DFT size.
+- Long codes: 2.6x (A76) / 8.8x (A55) faster than FFTW with 1/14-1/25 of the
+  CPU time. From the A55 the NPU searches faster than FFTW on the A76.
+- The tables were measured with the old data (14.1); the A76 benches with the
+  new data (2 visible + 1 invisible PRN per signal) gave the same times
+  (PocketFFT 697 / 3312, FFTW 381 / 2446, `cpu_opt` 204 / 1160, rknn
+  173 / 47 and 924 / 219 ms for L1CA / E1B; L1CP / L2CM FFTW 7362 / 15751,
+  rknn 2954 / 6036 ms) with all PASS.
+
+### 14.4 Channelizer for the 1568 MHz RF CH
+
+`-dec rfch:D[:foff]` defines decimated sub-bands; with `foff` the FIR is a
+bandpass with complex taps h[k] exp(-j 2 pi foff (k - H/2) / fs) (real part
+symmetric, imaginary part antisymmetric: 2 real MACs per tap) and the
+signals appear at f mod fs/D. `-dec 1:3:7.42,1:3:-6.902,2:3` decimates L1/E1/
+B1C (+7.42 MHz) and B1I (-6.902 MHz) of the RF CH 1 and L2C of the RF CH 2
+to 8 MHz. The group delay of the FIR ((ntap - 1) / 2 input samples, 6
+output samples with 12 D + 1 taps) is compensated by writing the output
+earlier (the decimated channels of 13.14 were delayed by 0.75 us = 225 m at
+16 MHz, an inter-frequency bias for multi-frequency observations). C/N0 vs
+no decimation (PC, first 60 s): L1CA +0.00, B1I -0.40, B1CP -0.32, L2CM
+-0.21, E1B/C -0.8 dB (BOC components outside +/-4 MHz).
+
+The check of uniform Doppler bins of the plugin (1e-6 DFT bins) failed for
+the single-precision Doppler bins of the receiver at Dopplers of a few kHz,
+and the assisted searches fell back to the matmul API (fixed: 1e-3 bins).
+
+### 14.5 Tracking capacity and signal quality
+
+pocket_trk on the new data (300 s, live-like input `-rcv_prio 10`, file
+input at the real time), signal sets from the 189 locked signals of 14.2
+(200: 189 + 11 duplicated) + 142 background search channels:
+
+| run | user CPU (min) | CPU (%) | max BUFF | LOCK (end) | PVT FIX | bad PR |
+|---|---|---|---|---|---|---|
+| 189, rknn (A55 acq), no dec | 32.4 | 90.6 | 79% | 168 / 331 | 236 / 236 | 0 / 3002 |
+| 189, rknn (A55 acq), dec | 29.7 | 80.7 | 6% | 186 / 331 | 238 / 238 | 0 / 3486 |
+| 189, FFTW `cpu_opt`, dec | 32.1 | 85.8 | 9% | 185 / 331 | 248 / 248 | 0 / 3647 |
+| 200, rknn (A55 acq), dec | 30.5 | 83.5 | 7% | 192 / 342 | 238 / 238 | 2 / 3471 |
+| 200, FFTW `cpu_opt`, dec | 32.9 | 88.0 | 9% | 195 / 342 | 247 / 247 | 0 / 3589 |
+
+(rknn: `-acc rknn -cpu_acq 0-3 -cpu_trk 0-7`, dec: `-dec 1:3:7.42,1:3:-6.902,2:3`,
+PVT FIX: within 50 m of the position, median error 1.5-1.6 m, bad PR:
+pseudoranges > 1 km off the median of the signals of the same satellite.)
+
+- With all signals locked the load is much higher than with the old data
+  (old: 200 channels with ~123 locked at 78-83%). Without decimation 189
+  signals are at the limit (BUFF 79%); with decimation ~200 signals at
+  84-88% (estimated limit ~210-220 signals).
+- The NPU lowers the CPU load by ~5 points (2.4 min of user CPU time per
+  5 min) against the best CPU search (`cpu_opt`) at the same capacity.
+- C/N0 (mean, t >= 100 s): L5I 40-41 vs L5Q ~48 dB-Hz, L1CD 35-36 vs L1CP
+  39-40 dB-Hz. The L5I deficit (7 dB) is not caused by the block misorder
+  (to be checked in PocketSDR).
+
+### 14.6 FE 4CH issues found
+
+- 16 KB block misorder: in the old data every second 16 KB (8192 samples)
+  block aligned to the file start was displaced by 16384 samples (two FX3 DMA
+  buffers). Each signal had two correlation peaks of similar power (code
+  phase and code phase + 16384 samples: 0.3173 ms mod 1 ms = 95.13 km at
+  24 MHz), the channels locked one of them at each acquisition and the
+  pseudoranges of the signals of a satellite differed by -95.13 km (+ n x
+  299.79 km), which broke the PVT (chi-square errors). The state is entered
+  when the FX3 is reset or re-configured on the USB while the FE stays
+  powered: `recover_dev()` of `sdr_dev.c` after a killed session ("SDR device
+  left streaming by the previous session - resetting."), or a de-/re-
+  authorization of the device. It is kept by normal stops and re-
+  authorizations and cleared only by a power cycle of the FE (unplug). The
+  firmware (v3.0, `FE_4CH/FW`, the same design in v4.0 of FE 8CH) suspends
+  and resumes only the consumer of the many-to-one DMA channel and starts the
+  GPIF state machine once; `app_stop()` / `app_start()` re-create the DMA
+  channel while the GPIF keeps switching the two producer sockets (a fix in
+  the firmware is pending). The check: label the 8192-sample blocks by the
+  code phase of a strong L1CA (even / odd blocks at the same phase).
+- USB transfer stops (`libusb bulk transfer error (2)`, the FE sends no data
+  until re-authorized): caused by the NPU (rate depends on the NPU clock:
+  none at 300 MHz, 3 s at 600 MHz, 0.2 s at 800 MHz with the FE next to the
+  board; reduced by another USB port and cleared mostly by a 1 m cable) and by
+  writing to the bus-powered USB 3.0 SSD (dumps stopped after 126-426 s,
+  none in 600 s without the SSD, with the SSD idle or writing to the NAS at
+  105 MB/s). CPU memory load does not cause it. IF data are recorded to the
+  NAS.
