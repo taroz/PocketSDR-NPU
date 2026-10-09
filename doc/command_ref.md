@@ -313,7 +313,8 @@ pocket_trk [-sig sig -prn prn[,...] [-rfch ch[,...]] ...]
            [-driver name] [-gain gain] [-bw bw] [-fd dopp]
            [-log path] [-nmea path] [-rtcm path] [-raw path] ...
            [-arch nch] [-geom file] [-acc backend] [-tacc backend]
-           [-cpu_acq cpus] [-cpu_trk cpus] [-rcv_prio prio] [-dec rfch:D[:foff][,...]]
+           [-cpu_acq cpus] [-cpu_trk cpus] [-rcv_prio prio] [-trk_guard pct]
+           [-dec rfch:D[:foff][,...]]
            [-h height] [-opt file] [-debug file] [-v] [file]
 ```
 
@@ -399,6 +400,11 @@ The input can be a local file, a TCP stream, a Pocket SDR FE device, or a SoapyS
     reads and unpacks the IF data, switches the search channel and updates
     the PVT every cycle, to keep it from waiting for the CPU under a high
     tracking load (Linux, needs root or CAP_SYS_NICE/rtprio). [not changed]
+- `-trk_guard pct`
+  - No new signal search is started while the IF data buffer usage of the
+    tracking channels (the delay of the slowest tracking channel) exceeds
+    `pct` (%), to keep the tracking in real time near the CPU limit (e.g. 20).
+    [0: off]
 - `-dec rfch:D[:foff][,...]`
   - Decimated sub-band of the RF CH (IQ sampling) by D (2, 3 or 4): a polyphase
     FIR (12 x D + 1 taps, Blackman window, cutoff 0.9 x fs/(2D)), lowpass or

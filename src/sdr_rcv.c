@@ -34,11 +34,6 @@
 //                   input thread, group delay compensated)
 //
 #include "pocket_sdr.h"
-#ifndef WIN32
-#include <sys/resource.h>
-#include <sys/syscall.h>
-#include <unistd.h>
-#endif
 
 // constants and macros ---------------------------------------------------------
 #define MAX_BUFF   8000         // max number of IF data buffer (* SDR_CYC)
@@ -583,29 +578,15 @@ static void ch_th_update(sdr_ch_th_t *th)
     th->ix += ch->N / nc;
 }
 
-// set CPU affinity and nice of SDR receiver CH thread by CH state -------------
-//   (search: CPUs of acquisition and nice + acq_nice, lock: CPUs of tracking
-//   and nice at start; the reset of nice needs CAP_SYS_NICE)
+// set CPU affinity of SDR receiver CH thread by CH state ---------------------
+//   (search: CPUs of acquisition, lock: CPUs of tracking)
 static void ch_th_cpu(sdr_ch_th_t *th)
 {
     int cpu = th->ch->state == SDR_STATE_LOCK ? 2 : 1;
     const char *cpus = cpu == 1 ? th->rcv->cpu_acq : th->rcv->cpu_trk;
     
-    if (th->cpu == cpu) return;
-    if (*th->rcv->cpu_acq || *th->rcv->cpu_trk) {
-        sdr_thread_affinity(*cpus ? cpus : SDR_CPU_ALL);
-    }
-#ifndef WIN32
-    if (th->rcv->acq_nice > 0) {
-        id_t tid = (id_t)syscall(SYS_gettid);
-        if (th->cpu == 0) th->nice0 = getpriority(PRIO_PROCESS, tid);
-        int nice = th->nice0 + (cpu == 1 ? th->rcv->acq_nice : 0);
-        if (setpriority(PRIO_PROCESS, tid, nice > 19 ? 19 : nice)) {
-            sdr_log(2, "$LOG,%.3f,%s,%d,set nice error (%d)", 0.0, th->ch->sig,
-                th->ch->prn, nice);
-        }
-    }
-#endif
+    if (th->cpu == cpu || (!*th->rcv->cpu_acq && !*th->rcv->cpu_trk)) return;
+    sdr_thread_affinity(*cpus ? cpus : SDR_CPU_ALL);
     th->cpu = cpu;
 }
 
@@ -863,8 +844,6 @@ static void set_srch_ch(sdr_rcv_t *rcv, const char *opt)
 //                     -CPU_TRK=<cpus>: CPUs of tracking (e.g. 4-7)
 //                     -RCV_PRIO=<prio>: real-time priority (SCHED_RR) of IF
 //                         input thread (1-99, 0: not changed)
-//                     -ACQ_NICE=<n>: nice increment of CH threads in search
-//                         state (1-39, 0: not changed)
 //                     -TRK_GUARD=<pct>: no new signal search while the IF
 //                         buffer usage of the tracking CHs > pct (0: off)
 //                     -DEC=<rfch>:<D>[:<foff>][,...]: decimated sub-band of RF
@@ -898,7 +877,6 @@ sdr_rcv_t *sdr_rcv_new(const char **sigs, const int *prns, int n, int fmt,
     if ((p = strstr(opt, "-CPU_ACQ="))) sscanf(p, "-CPU_ACQ=%63s", rcv->cpu_acq);
     if ((p = strstr(opt, "-CPU_TRK="))) sscanf(p, "-CPU_TRK=%63s", rcv->cpu_trk);
     if ((p = strstr(opt, "-RCV_PRIO="))) sscanf(p, "-RCV_PRIO=%d", &rcv->rcv_prio);
-    if ((p = strstr(opt, "-ACQ_NICE="))) sscanf(p, "-ACQ_NICE=%d", &rcv->acq_nice);
     if ((p = strstr(opt, "-TRK_GUARD="))) sscanf(p, "-TRK_GUARD=%d", &rcv->trk_guard);
     rcv->fmt = fmt;
     rcv->fs = fs;

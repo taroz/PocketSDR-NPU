@@ -325,7 +325,6 @@ typedef struct {                // SDR receiver channel thread type
     int batch;                  // tracked by batched correlator group (0/1)
     int sub;                    // decimated sub-band (-1: none)
     int cpu;                    // CPU affinity set (0:none,1:acq,2:trk)
-    int nice0;                  // nice value of CH thread at start
     sdr_mutex_t mtx;            // lock of channel update (batched correlator)
 } sdr_ch_th_t;
 
@@ -436,7 +435,6 @@ typedef struct sdr_rcv_tag {    // SDR receiver type
     char cpu_acq[64];           // CPUs of acquisition (option -CPU_ACQ)
     char cpu_trk[64];           // CPUs of tracking (option -CPU_TRK)
     int rcv_prio;               // real-time priority of IF input thread (0:off)
-    int acq_nice;               // nice increment of search CH threads (0:off)
     int trk_guard;              // no new search if tracking buffer usage (%) > trk_guard (0:off)
     int nsub;                   // number of decimated sub-bands (option -DEC)
     int sub_rf[SDR_MAX_SUB];    // RF CH of sub-band
