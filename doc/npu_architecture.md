@@ -1406,3 +1406,118 @@ pseudoranges > 1 km off the median of the signals of the same satellite.)
   none in 600 s without the SSD, with the SSD idle or writing to the NAS at
   105 MB/s). CPU memory load does not cause it. IF data are recorded to the
   NAS.
+
+### 14.7 Comparison for the paper (new data)
+
+Acquisition, time / CPU time per search (ms), CPU x NPU and without / with
+the shared DFT (NPU: shift `_s`, CPU: `cpu_opt`), all PASS (same detections
+as PocketFFT, max diff C/N0 0.1 dB, code 0):
+
+| backend | L1CA A76 | E1B A76 | L1CA A55 | E1B A55 |
+|---|---|---|---|---|
+| PocketFFT `cpu` | 697 / 697 | 3312 / 3297 | 2739 / 2739 | 17405 / 17388 |
+| FFTW `cpu` | 381 / 381 | 2446 / 2430 | 1811 / 1811 | 10663 / 10647 |
+| FFTW `cpu_opt` (shared DFT) | 204 / 204 | 1160 / 1144 | 950 / 950 | 5396 / 5380 |
+| rknn `_f` (`noshift`) | 270 / 51 | 1647 / 252 | 355 / 164 | 1781 / 635 |
+| rknn `_s` (shared DFT) | **173 / 47** | **924 / 219** | **263 / 152** | **1220 / 583** |
+| rknn `_fq` (`int8`) | 191 / 47 | 920 / 211 | 286 / 164 | 1255 / 566 |
+
+| backend | L1CP A76 | L2CM A76 | L1CP A55 | L2CM A55 |
+|---|---|---|---|---|
+| FFTW `cpu` | 7362 / 7343 | 15751 / 15731 | 31068 / 31047 | 65339 / 65316 |
+| FFTW `cpu_opt` | 3824 / 3805 | 15719 / 15699 | 15057 / 15037 | 64664 / 64641 |
+| rknn `_f` (`noshift`) | 5512 / 668 | 10732 / 1232 | 5797 / 1497 | 11839 / 2853 |
+| rknn `_s` | **2954 / 572** | **6036 / 1121** | **3663 / 1410** | **7510 / 2715** |
+
+- The shared DFT gives 1.9-2.1x on the CPU (L2CM: none, the DFT of 960000
+  points is not shared by `cpu_opt`) and 1.3-1.8x on the NPU.
+- INT8 (`_fq`) is not faster than `_s` and missed L1CA PRN 16 (C/N0 34.5
+  dB-Hz by PocketFFT, 34.0 by INT8, below the threshold); in tracking
+  (189 signals, A55 acq, dec) the C/N0 of the tracked signals was the same
+  and LOCK 180 vs 185, LOST 76 vs 62. INT8 stays an option.
+
+Tracking (189 signals + 142 search channels, 300 s, `-rcv_prio 10`):
+
+| config | user CPU (min) | CPU (%) | max BUFF | LOCK | PVT FIX |
+|---|---|---|---|---|---|
+| PocketFFT `cpu` (stock) | 31.3 | 85.8 | **125%** | 155 | 207 / 207 |
+| FFTW `cpu` | 31.9 | 87.2 | **112%** | 154 | 207 / 207 |
+| FFTW `cpu_opt` | 35.0 | 95.4 | 49% | 170 | 237 / 237 |
+| rknn (A55 acq) | 32.4 | 90.6 | 79% | 168 | 236 / 236 |
+| FFTW `cpu_opt` + dec | 32.1 | 85.8 | 9% | 185 | 248 / 248 |
+| rknn (A55 acq) + dec | **29.7** | **80.7** | 6% | 186 | 238 / 238 |
+
+- Without the decimation the stock receiver and FFTW overflow the IF buffer
+  (> 100%: the IF data are not processed in real time) with 189 signals;
+  the faster search (`cpu_opt`, rknn) keeps it below 100%, and the
+  decimation gives the margin. The NPU saves ~5 points of CPU (~2.4 min of
+  user CPU time per 5 min) against `cpu_opt` with the decimation.
+- C/N0 change by the decimation (D = 3 to 8 MHz, paired by signal and epoch,
+  100 signals, rknn): L1CA -0.1, B1I -0.3, B1CD/P -0.4, L1CD/P -0.5/-0.6,
+  L1S -0.5, E1B/C -0.7/-0.5, L2CM +0.1 dB, the non-decimated L5/E5a/E5b
+  bands +/-0.0 dB; the median PVT error 1.4 -> 1.9 m and LOST 31 -> 56.
+- L5 false lock: no step of the pseudorange difference to the L1 signal of
+  the same satellite (> 8 m between epochs: half a chip of L5 = 14.7 m) and
+  no bump-jump event at 24 MHz (the same at 16 MHz). The repeated losses of
+  L5 signals of the old data were caused by the block misorder; with the new
+  data the losses are <= 12 per signal type in 300 s.
+
+Acquisition backend x thread placement (189 signals + dec, 300 s; A55 acq:
+`-cpu_acq 0-3 -cpu_trk 0-7`):
+
+| config | user CPU (min) | CPU (%) | A55 / A76 (%) | LOCK 30 / 60 / 120 / 290 s | FOUND |
+|---|---|---|---|---|---|
+| `cpu_opt`, any core | 32.1 | 85.8 | 85.6 / 82.4 | 106 / 157 / 168 / 182 | 248 |
+| `cpu_opt`, A55 acq | 24.6 | 66.1 | 72.5 / 58.2 | 22 / 68 / 120 / 159 | 200 |
+| rknn, any core | 30.6 | 83.2 | 84.4 / 78.4 | 108 / 149 / 170 / 183 | 272 |
+| rknn, A55 acq | **29.7** | **80.7** | 82.9 / 75.4 | 86 / 149 / 169 / 186 | 248 |
+
+- The tracking (correlators, loops, decimation) is the same code in all
+  configs; only the search backend and the placement differ.
+- With the same placement the NPU saves 2.6 points (83.2 vs 85.8%); placing
+  the searches of the NPU on the A55 saves 2.5 more. With `cpu_opt` the A55
+  are too slow for the searches (950 ms per L1CA): the lower load comes from
+  fewer locked signals (159 vs 182 at 290 s, 22 vs 106 at 30 s), not from a
+  higher capacity.
+
+### 14.8 Maximum channels and NPU memory interference
+
+Maximum channels (N = 220-320: 189 locked signals + duplicates, + 142 search
+channels, dec, 300 s). The usage of the IF buffer was split into the tracking
+and the search channels (debug log `$LOG,...,BUFF all TRK x sig prn SRCH y sig
+prn` every 1 s).
+
+| config | N = 220 | 240 | 260 | 290 | 320 |
+|---|---|---|---|---|---|
+| `cpu_opt` | 12% | 17% | 30-39% (TRK 19-35%) | - | - |
+| rknn, any core | 72% | 96% | 112-173% (TRK 106-127%) | - | - |
+| rknn, A55 acq | 8% | 27% | 106% (TRK 106%) | - | - |
+| `cpu_opt` + guard 20 | - | - | TRK 24% / mean 3.3% | TRK 58% / 13.1% | TRK 106% / 35.4% |
+| rknn, A55 acq + guard 20 | - | - | TRK 40% / mean 4.3% | TRK 131% / 15.8% | TRK 135% / 34.1% |
+
+- With the NPU the tracking channels (24 MHz L5/E5/B2 channels) fell behind
+  first, with `cpu_opt` only the search channel. Not the cause: the search
+  threads competing with the tracking (nice + 10 for the search threads,
+  `-acq_nice`), the nice -19 the RKNN runtime (NPU driver) sets for the
+  process (no setpriority call; the same with all threads at nice 0), the
+  NPU clock (600 / 300 MHz), INT8, the kernel time (sys +15-25 s / 5 min),
+  the CPU clocks or temperatures.
+- NPU memory interference: the time of the tracking correlator bench on an
+  A76 (L5I/Q, E5aI, E5bI, L1CA, 20 s) with an acquisition bench on another
+  core (nice 0): none 22.97 us/ch-epoch, rknn `_s` 24.43 (+6.4%), `_f` 24.42
+  (+6.3%), INT8 24.26 (+5.6%), `_s` at 300 MHz 23.77 (+3.5%), FFTW `cpu_opt`
+  23.66 (+1.4%), memcpy stream 24.31 (+4.2%). The NPU slows the memory bound
+  tracking by ~5% in proportion to its DRAM traffic rate; in the receiver the
+  traffic per search is fixed (the number of searches is the same at lower
+  clocks). The traffic is dominated by the intermediate tensors of the
+  four-step DFT (internal memory of the models: L1CA 4.5 MB, E1B 64 MB, weights
+  2.6 / 5.7 MB per inference) rather than the outputs. The NPU SRAM
+  (`RKNN_FLAG_ENABLE_SRAM`) is not reserved by the kernel (total_sram_size 0).
+  (An NPU bench with the nice -19 of the RKNN runtime on the same core as the
+  receiver threads showed 106% tracking delay; at nice 0 41%.)
+- `-trk_guard pct` (no new search while the IF buffer usage of the tracking
+  CHs > pct) keeps the tracking of rknn A55 acq at 260 channels (TRK max 107
+  -> 40%, CPU 88.6% vs 92.9% of `cpu_opt`), with slower initial locks (152 vs
+  184 at 60 s). Both configs reach the limit at ~260-290 channels: the NPU
+  saves 3-4 points of CPU but not the maximum channels, which is set by the
+  tracking on the CPU and reduced by the NPU memory interference.

@@ -61,7 +61,7 @@ static const char *usage_text[] = {
     "       [-driver name] [-gain gain] [-bw bw] [-fd dopp]",
     "       [-log path] [-nmea path] [-rtcm path] [-raw path] ... [-opt file]",
     "       [-arch nch] [-geom file] [-acc backend] [-tacc backend]",
-    "       [-cpu_acq cpus] [-cpu_trk cpus] [-rcv_prio prio]",
+    "       [-cpu_acq cpus] [-cpu_trk cpus] [-rcv_prio prio] [-acq_nice n] [-trk_guard pct]",
     "       [-dec rfch:D[:foff][,...]] [file]",
     NULL
 };
@@ -241,7 +241,7 @@ int main(int argc, char **argv)
     char rfch_opt[1024] = "-RFCH";
     const char *geom_file = "";
     const char *acc = "cpu", *tacc = "", *cpu_acq = "", *cpu_trk = "";
-    int rcv_prio = 0;
+    int rcv_prio = 0, acq_nice = 0, trk_guard = 0;
     const char *dec = "";
 
     for (int i = 1; i < argc; i++) {
@@ -332,6 +332,10 @@ int main(int argc, char **argv)
             cpu_trk = argv[++i];
         } else if (!strcmp(argv[i], "-rcv_prio") && i + 1 < argc) {
             rcv_prio = atoi(argv[++i]);
+        } else if (!strcmp(argv[i], "-acq_nice") && i + 1 < argc) {
+            acq_nice = atoi(argv[++i]);
+        } else if (!strcmp(argv[i], "-trk_guard") && i + 1 < argc) {
+            trk_guard = atoi(argv[++i]);
         } else if (!strcmp(argv[i], "-dec") && i + 1 < argc) {
             dec = argv[++i];
         } else if (!strcmp(argv[i], "-v")) {
@@ -385,6 +389,14 @@ int main(int argc, char **argv)
     if (rcv_prio > 0) {
         size_t len = strlen(rfch_opt);
         snprintf(rfch_opt + len, sizeof(rfch_opt) - len, " -RCV_PRIO=%d", rcv_prio);
+    }
+    if (acq_nice > 0) {
+        size_t len = strlen(rfch_opt);
+        snprintf(rfch_opt + len, sizeof(rfch_opt) - len, " -ACQ_NICE=%d", acq_nice);
+    }
+    if (trk_guard > 0) {
+        size_t len = strlen(rfch_opt);
+        snprintf(rfch_opt + len, sizeof(rfch_opt) - len, " -TRK_GUARD=%d", trk_guard);
     }
     if (*dec) {
         size_t len = strlen(rfch_opt);

@@ -63,7 +63,8 @@
 //  pulsed interference (CW J/N 10 dB: C/N0 metric +11 dB, false detections),
 //  so they are not used by default.
 //
-//  options: [cores=n][,int8][,noshift][,fp32][,mm][,hostwipe][,nofold][,model=dir]
+//  options: [cores=n][,int8][,noshift][,lowprio][,fp32][,mm][,hostwipe][,nofold]
+//           [,model=dir]
 //           cores=n: number of NPU cores (worker threads) (default: 3)
 //           fp32   : FP32 output of matmul API (default: FP16)
 //           mm     : matmul API only (no RKNN models)
@@ -74,6 +75,8 @@
 //           noshift: no shared DFT models (acq_*_s.rknn, code DFT rolled by
 //                  bin, used if exist by default)
 //                  instead of FP16 models (acq_*_f.rknn) (weak to interference)
+//           lowprio: no high process priority set by the RKNN runtime
+//                  (RKNN_FLAG_DISABLE_PROC_HIGH_PRIORITY, default: nice -19)
 //           model=dir: directory of RKNN models (default: $SDR_ACC_RKNN_MODEL
 //                  or <plugin dir>/rknn)
 //  environment: SDR_ACC_RKNN_MODEL: directory of RKNN models
@@ -214,6 +217,7 @@ static int wipe_model = 1;          // carrier wipe-off in RKNN models
 static int fold_model = 1;          // carrier folded into DFT in RKNN models
 static int int8_model = 0;          // INT8 RKNN models (_fq)
 static int shift_model = 1;         // shared DFT RKNN models (_s)
+static int low_prio = 0;            // no high process priority by RKNN runtime
 static std::string model_dir;       // directory of RKNN models
 static int nref = 0;
 static int prof_on = 0;
@@ -641,7 +645,8 @@ static rmodel_t *get_rmodel(worker_t *w, int M, int Kc, int R, int kind)
     std::unique_ptr<rmodel_t> m(new rmodel_t);
     rknn_input_output_num io;
     if (n != buff.size() ||
-        rknn_init(&m->ctx, buff.data(), buff.size(), 0, NULL) < 0 ||
+        rknn_init(&m->ctx, buff.data(), buff.size(),
+            low_prio ? RKNN_FLAG_DISABLE_PROC_HIGH_PRIORITY : 0, NULL) < 0 ||
         rknn_set_core_mask(m->ctx, (rknn_core_mask)(1 << w->id)) < 0 ||
         rknn_query(m->ctx, RKNN_QUERY_IN_OUT_NUM, &io, sizeof(io)) < 0 ||
         io.n_input != (kind == RM_WIPE ? 8u : 4u) || io.n_output != 1) {
@@ -1058,6 +1063,7 @@ static int rk_init(const char *opt)
     use_model = wipe_model = fold_model = 1;
     int8_model = 0;
     shift_model = 1;
+    low_prio = 0;
     model_dir.clear();
     std::string s = opt ? opt : "";
     for (size_t p = 0; p < s.size(); ) {
@@ -1073,6 +1079,7 @@ static int rk_init(const char *opt)
         else if (t == "int8") int8_model = 1;
         else if (t == "shift") shift_model = 1; // (default)
         else if (t == "noshift") shift_model = 0;
+        else if (t == "lowprio") low_prio = 1;
         else if (t.compare(0, 6, "model=") == 0) model_dir = t.substr(6);
         else if (!t.empty()) fprintf(stderr, "sdr_acc_rknn: unknown option %s\n",
             t.c_str());

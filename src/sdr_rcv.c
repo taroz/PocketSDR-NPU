@@ -34,6 +34,11 @@
 //                   input thread, group delay compensated)
 //
 #include "pocket_sdr.h"
+#ifndef WIN32
+#include <sys/resource.h>
+#include <sys/syscall.h>
+#include <unistd.h>
+#endif
 
 // constants and macros ---------------------------------------------------------
 #define MAX_BUFF   8000         // max number of IF data buffer (* SDR_CYC)
@@ -578,15 +583,29 @@ static void ch_th_update(sdr_ch_th_t *th)
     th->ix += ch->N / nc;
 }
 
-// set CPU affinity of SDR receiver CH thread by CH state ---------------------
-//   (search: CPUs of acquisition, lock: CPUs of tracking)
+// set CPU affinity and nice of SDR receiver CH thread by CH state -------------
+//   (search: CPUs of acquisition and nice + acq_nice, lock: CPUs of tracking
+//   and nice at start; the reset of nice needs CAP_SYS_NICE)
 static void ch_th_cpu(sdr_ch_th_t *th)
 {
     int cpu = th->ch->state == SDR_STATE_LOCK ? 2 : 1;
     const char *cpus = cpu == 1 ? th->rcv->cpu_acq : th->rcv->cpu_trk;
     
-    if (th->cpu == cpu || (!*th->rcv->cpu_acq && !*th->rcv->cpu_trk)) return;
-    sdr_thread_affinity(*cpus ? cpus : SDR_CPU_ALL);
+    if (th->cpu == cpu) return;
+    if (*th->rcv->cpu_acq || *th->rcv->cpu_trk) {
+        sdr_thread_affinity(*cpus ? cpus : SDR_CPU_ALL);
+    }
+#ifndef WIN32
+    if (th->rcv->acq_nice > 0) {
+        id_t tid = (id_t)syscall(SYS_gettid);
+        if (th->cpu == 0) th->nice0 = getpriority(PRIO_PROCESS, tid);
+        int nice = th->nice0 + (cpu == 1 ? th->rcv->acq_nice : 0);
+        if (setpriority(PRIO_PROCESS, tid, nice > 19 ? 19 : nice)) {
+            sdr_log(2, "$LOG,%.3f,%s,%d,set nice error (%d)", 0.0, th->ch->sig,
+                th->ch->prn, nice);
+        }
+    }
+#endif
     th->cpu = cpu;
 }
 
@@ -844,6 +863,10 @@ static void set_srch_ch(sdr_rcv_t *rcv, const char *opt)
 //                     -CPU_TRK=<cpus>: CPUs of tracking (e.g. 4-7)
 //                     -RCV_PRIO=<prio>: real-time priority (SCHED_RR) of IF
 //                         input thread (1-99, 0: not changed)
+//                     -ACQ_NICE=<n>: nice increment of CH threads in search
+//                         state (1-39, 0: not changed)
+//                     -TRK_GUARD=<pct>: no new signal search while the IF
+//                         buffer usage of the tracking CHs > pct (0: off)
 //                     -DEC=<rfch>:<D>[:<foff>][,...]: decimated sub-band of RF
 //                         CH by D (2,3,4) with FIR lowpass (foff: 0) or
 //                         bandpass centered at foff (MHz) for the CHs of the RF
@@ -875,6 +898,8 @@ sdr_rcv_t *sdr_rcv_new(const char **sigs, const int *prns, int n, int fmt,
     if ((p = strstr(opt, "-CPU_ACQ="))) sscanf(p, "-CPU_ACQ=%63s", rcv->cpu_acq);
     if ((p = strstr(opt, "-CPU_TRK="))) sscanf(p, "-CPU_TRK=%63s", rcv->cpu_trk);
     if ((p = strstr(opt, "-RCV_PRIO="))) sscanf(p, "-RCV_PRIO=%d", &rcv->rcv_prio);
+    if ((p = strstr(opt, "-ACQ_NICE="))) sscanf(p, "-ACQ_NICE=%d", &rcv->acq_nice);
+    if ((p = strstr(opt, "-TRK_GUARD="))) sscanf(p, "-TRK_GUARD=%d", &rcv->trk_guard);
     rcv->fmt = fmt;
     rcv->fs = fs;
     rcv->nrfch = num_rfch(fmt);
@@ -1473,18 +1498,38 @@ static void update_scale(sdr_rcv_t *rcv)
 // update IF data buffer usage rate --------------------------------------------
 static void update_buff_use(sdr_rcv_t *rcv)
 {
+    double use_trk = 0.0, use_srch = 0.0;
+    int i_trk = -1, i_srch = -1;
     rcv->stats.buff_use = 0.0;
     int64_t ix = get_buff_ix(rcv);
     for (int i = 0; i < rcv->nch; i++) {
         double use = (ix - rcv->th[i]->ix) * 100.0 / MAX_BUFF;
         if (use > rcv->stats.buff_use) rcv->stats.buff_use = use;
+        if (rcv->th[i]->ch->state == SDR_STATE_LOCK) {
+            if (use > use_trk) use_trk = use, i_trk = i;
+        } else if (rcv->th[i]->ch->state == SDR_STATE_SRCH) {
+            if (use > use_srch) use_srch = use, i_srch = i;
+        }
     }
+    rcv->stats.buff_trk = use_trk;
+    
+    // buffer usage of tracking and search channels (for debug)
+    sdr_log(4, "$LOG,%.3f,,0,BUFF %.1f TRK %.1f %s %d SRCH %.1f %s %d", ix * SDR_CYC,
+        rcv->stats.buff_use, use_trk, i_trk >= 0 ? rcv->th[i_trk]->ch->sig : "",
+        i_trk >= 0 ? rcv->th[i_trk]->ch->prn : 0, use_srch,
+        i_srch >= 0 ? rcv->th[i_srch]->ch->sig : "",
+        i_srch >= 0 ? rcv->th[i_srch]->ch->prn : 0);
 }
 
 // update signal search channel ------------------------------------------------
 static void update_srch_ch(sdr_rcv_t *rcv)
 {
     if (rcv->stats.buff_use > MAX_BUFF_USE) { // IF data buffer full ?
+        return;
+    }
+    // tracking channels delayed ? (no new search to keep tracking)
+    if (rcv->trk_guard > 0 && rcv->stats.buff_trk > rcv->trk_guard &&
+        (rcv->ich < 0 || rcv->th[rcv->ich]->ch->state != SDR_STATE_SRCH)) {
         return;
     }
     // signal search channel busy ?
