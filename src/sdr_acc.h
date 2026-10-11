@@ -13,6 +13,7 @@
 //  2026-10-02  1.0  new
 //  2026-10-03  1.1  add batched tracking correlator (API version 2)
 //  2026-10-03  1.2  add parallel code search of int8 IF samples (API version 3)
+//  2026-10-11  1.3  add parallel code search of multiple windows (API version 4)
 //
 #ifndef SDR_ACC_H
 #define SDR_ACC_H
@@ -21,7 +22,8 @@
 extern "C" {
 #endif
 
-#define SDR_ACC_API_VER 3       // plugin API version
+#define SDR_ACC_API_VER 4       // plugin API version
+#define SDR_ACC_API_MIN 3       // min plugin API version supported
 
 typedef struct {                // accelerator profile of a call
     double t_in;                // input tensor preparation time (s)
@@ -93,6 +95,14 @@ typedef struct {                // accelerator backend plugin
     int (*search_code_i8)(const int8_t *x, const float *code, int M,
         double fs, const double *fc, int K, int nout, float *P, int ldP,
         sdr_acc_prof_t *prof);
+
+    // parallel code search of NW windows of int8 IF samples x [NW][M][2]
+    // (I,Q) with non-coherent integration of all windows (other arguments
+    // are same as search_code()) (NULL: not supported, search_code_i8() or
+    // search_code() used for each window) (API version >= 4)
+    int (*search_code_i8_multi)(const int8_t **x, int NW, const float *code,
+        int M, double fs, const double *fc, int K, int nout, float *P,
+        int ldP, sdr_acc_prof_t *prof);
 } sdr_acc_plugin_t;
 
 // plugin entry point (exported by backend shared library)

@@ -15,12 +15,27 @@
 //
 //  A HEF acq_M<M>_K<Kc>_R<R>_h.hef has Kc bins per inference (chunk) spaced by
 //  fs / M. The chunks of a call are run asynchronously as frames of one job.
-//  The INT8 model with the 16-bit power tail has the power NRMSE about 0.07
-//  (1 ms codes of 10.23 Mcps) to 0.13 (L1CA) and the C/N0 within 0.2 dB of the
-//  CPU reference.
+//  The INT8 model with the 16-bit power tail has the power NRMSE about 0.05-0.1
+//  (20 ms non-coherent integration) and the C/N0 within 0.2 dB of the CPU
+//  reference.
+//
+//  Notes on HEFs (Dataflow Compiler 5.4.0, HailoRT 5.4.0, Hailo-10H):
+//  - Some multi-context HEFs output partly displaced samples on the device
+//    (not in the emulator), e.g. Kc = 7, R = 100 (output features 700): +2 or
+//    +B-6 samples in groups of 8 columns. R is padded to avoid it (Kc = 7,
+//    R = 112 for M = 48000 and R = 64 for M = 16000 verified). A HEF has to
+//    be verified on the device by the peak positions of all code offsets.
+//  - The calibration set has to include the codes of 10.23 Mcps (flat code
+//    spectrum normalized by the max magnitude), otherwise the peaks of strong
+//    signals are clipped and the Doppler bin of the max power is wrong.
+//
+//  All windows of an acquisition are searched in one call by
+//  search_code_i8_multi() (the frames of the windows and chunks in one job),
+//  which is much faster with the batch size 8-16 than the call per window.
 //
 //  options: [hef=dir][,batch=n]
-//           batch=n: batch size of the models (default: HailoRT default)
+//           batch=n: batch size of the models (default: HailoRT default,
+//                  8-16 recommended for multi-window search)
 //           hef=dir: directory of HEFs (default: $SDR_ACC_HAILO_HEF or
 //                  <plugin dir>/hailo)
 //  environment: SDR_ACC_HAILO_HEF: directory of HEFs
@@ -213,12 +228,17 @@ static int search_multi(const float **xs, const int8_t **x8s, int NW,
     for (int k = 1; k < K; k++) {
         if (fabs((fc[k] - fc[0]) * M / fs - k) > 1e-3) return 0;
     }
-    // model with the largest Kc <= K (7, 3, 1) and R = nout / B
+    // model with the largest Kc (7, 3, 1) and the smallest R >= nout / B
+    // (R < nout / B + 16, R padded for the output features to avoid the
+    // corrupted outputs of some multi-context HEFs) (a frame of Kc = 7 takes
+    // about the same time as that of Kc = 1, the bins >= K are not used)
     int R = (nout + B - 1) / B;
     hmodel_t *m = NULL;
     static const int kcs[] = {7, 3, 1};
     for (int i = 0; i < 3 && !m; i++) {
-        if (kcs[i] <= K) m = get_model(M, kcs[i], R);
+        for (int r = R; r < R + 16 && !m; r++) {
+            m = get_model(M, kcs[i], r);
+        }
     }
     if (!m) return 0;
     int Kc = m->Kc, nch = (K + Kc - 1) / Kc, F = NW * nch;
@@ -384,6 +404,13 @@ static int acc_search_code_i8(const int8_t *x, const float *code, int M,
     return search_code(NULL, x, code, M, fs, fc, K, nout, P, ldP, prof);
 }
 
+static int acc_search_code_i8_multi(const int8_t **x, int NW, const float *code,
+    int M, double fs, const double *fc, int K, int nout, float *P, int ldP,
+    sdr_acc_prof_t *prof)
+{
+    return search_multi(NULL, x, NW, code, M, fs, fc, K, nout, P, ldP, prof);
+}
+
 // initialize / finalize -------------------------------------------------------
 static int acc_init(const char *opt)
 {
@@ -427,7 +454,7 @@ static void acc_exit(void)
 
 static const sdr_acc_plugin_t plugin = {
     SDR_ACC_API_VER, "hailo", acc_init, acc_exit, acc_search_code, NULL,
-    acc_search_code_i8
+    acc_search_code_i8, acc_search_code_i8_multi
 };
 
 extern "C" const sdr_acc_plugin_t *sdr_acc_plugin(void)

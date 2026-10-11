@@ -27,6 +27,8 @@
 //  2026-10-02  1.0  new
 //  2026-10-03  1.1  add tracking correlator backends (batched correlator)
 //  2026-10-08  1.2  cpu_mt: default threads = CPUs of the thread affinity
+//  2026-10-11  1.3  add sdr_acc_search_multi(), sdr_acc_search_code_multi()
+//                   plugin: CPU optimized for unsupported shapes
 //
 #if !defined(WIN32) && !defined(_GNU_SOURCE)
 #define _GNU_SOURCE         // sched_getaffinity()
@@ -166,7 +168,8 @@ static int load_plugin(const char *name, const char *opt, void **lib_p,
     sdr_acc_plugin_func_t func =
         (sdr_acc_plugin_func_t)lib_sym(lib, "sdr_acc_plugin");
     const sdr_acc_plugin_t *plugin = func ? func() : NULL;
-    if (!plugin || plugin->api_ver != SDR_ACC_API_VER) {
+    if (!plugin || plugin->api_ver < SDR_ACC_API_MIN ||
+        plugin->api_ver > SDR_ACC_API_VER) {
         fprintf(stderr, "accelerator plugin version error: %s\n", file);
         lib_close(lib);
         return 0;
@@ -271,8 +274,8 @@ static void update_stat(int stat, double t, double t_conv,
 // persistent thread-local buffer ----------------------------------------------
 static void *acc_buff(int idx, size_t size)
 {
-    static __thread void *buff[3] = {NULL};
-    static __thread size_t size_buff[3] = {0};
+    static __thread void *buff[4] = {NULL};
+    static __thread size_t size_buff[4] = {0};
 
     if (size > size_buff[idx]) {
         sdr_cpx_free((sdr_cpx_t *)buff[idx]);
@@ -395,7 +398,8 @@ static int search_code_opt(const sdr_cpx_t *code_fft, const sdr_buff_t *buff,
 //------------------------------------------------------------------------------
 //  Parallel code search by accelerator backend. The arguments are same as
 //  sdr_search_code2(). The results are equivalent to the CPU reference within
-//  the numerical tolerance of the backend.
+//  the numerical tolerance of the backend. If a plugin does not support the
+//  shape, the CPU optimized backend is used.
 //
 //  return:
 //      Status (1: OK, 0: CPU reference backend or not supported by backend)
@@ -411,11 +415,60 @@ int sdr_acc_search_code(const sdr_cpx_t *code_fft, double T,
         return search_code_opt(code_fft, buff, ix, N, Nmax, fs, fi, fds,
             len_fds, P);
     }
-    if (acc_type == SDR_ACC_PLUGIN) {
+    if (acc_type == SDR_ACC_PLUGIN) { // CPU optimized if not supported
         return search_code_plugin(code_fft, buff, ix, N, Nmax, fs, fi, fds,
-            len_fds, P);
+            len_fds, P) || search_code_opt(code_fft, buff, ix, N, Nmax, fs, fi,
+            fds, len_fds, P);
     }
     return 0;
+}
+
+//------------------------------------------------------------------------------
+//  Check whether the accelerator backend supports the parallel code search of
+//  multiple windows (sdr_acc_search_code_multi()).
+//
+//  return:
+//      Status (1: supported, 0: not supported)
+//
+int sdr_acc_search_multi(void)
+{
+    return acc_type == SDR_ACC_PLUGIN && acc_plugin->api_ver >= 4 &&
+        acc_plugin->search_code_i8_multi;
+}
+
+//------------------------------------------------------------------------------
+//  Parallel code search of multiple windows by accelerator backend. The
+//  correlation powers of the windows starting at buffer indices ix[NW] are
+//  added to P. Other arguments are same as sdr_acc_search_code().
+//
+//  return:
+//      Status (1: OK, 0: not supported by backend (P not updated))
+//
+int sdr_acc_search_code_multi(const sdr_cpx_t *code_fft, double T,
+    const sdr_buff_t *buff, const int *ix, int NW, int N, int Nmax, double fs,
+    double fi, const float *fds, int len_fds, float *P)
+{
+    if (!sdr_acc_search_multi() || NW <= 0 || Nmax <= 0 || Nmax > N) {
+        return 0;
+    }
+    sdr_acc_prof_t prof = {0};
+    double t0 = acc_time(), t1;
+    double *fc = (double *)acc_buff(1, sizeof(double) * len_fds);
+    int8_t *x8 = (int8_t *)acc_buff(0, 2 * (size_t)N * NW);
+    const int8_t **xs = (const int8_t **)acc_buff(3, sizeof(int8_t *) * NW);
+    
+    for (int i = 0; i < len_fds; i++) {
+        fc[i] = fi + fds[i];
+    }
+    for (int i = 0; i < NW; i++) {
+        buff_to_i8(buff, ix[i], N, x8 + 2 * (size_t)N * i);
+        xs[i] = x8 + 2 * (size_t)N * i;
+    }
+    t1 = acc_time();
+    int stat = acc_plugin->search_code_i8_multi(xs, NW, (const float *)code_fft,
+        N, fs, fc, len_fds, Nmax, P, N, &prof);
+    update_stat(stat, acc_time() - t0, t1 - t0, &prof);
+    return stat;
 }
 
 //------------------------------------------------------------------------------

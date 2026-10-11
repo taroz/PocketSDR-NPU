@@ -111,11 +111,21 @@ One call is one non-coherent integration step of the parallel code search:
 - `fc [K]`: carrier frequencies of the Doppler bins (IF + Doppler)
 - `P [K][ldP]`: `P[k][n] += |IDFT(DFT(x * exp(-j2πfc[k]t)) * code)[n]|^2 / M^2`
   for `n < nout` (same scale as the CPU reference)
-- returns 0 for unsupported shapes -> CPU reference fallback
+- returns 0 for unsupported shapes -> CPU optimized (`cpu_opt`) fallback
+  (CPU reference if the Doppler bins are not on the DFT grid)
 
 `search_code_i8()` (plugin API version 3, optional) takes the IF samples as
 complex int8 (for integer pipelines of NPUs); the generic layer uses it if
 the plugin provides it.
+
+`search_code_i8_multi()` (plugin API version 4, optional) searches the `NW`
+windows `x [NW][M][2]` (complex int8) of one acquisition and adds the powers
+of all windows to `P`. If the backend provides it (`sdr_acc_search_multi()`),
+the channel in the search state only records the buffer indices of the
+windows and searches all of them at once by `sdr_acc_search_code_multi()`
+when the integration time is reached (each window by `sdr_search_code2()` if
+it fails). It is for NPUs with a high per-call overhead and a large gain of
+batching (Hailo, see 14.9). Plugins of API version 3 are still loaded.
 
 The generic layer converts the IF ring buffer (`sdr_buff_t`, 4+4 bit complex)
 to the float tensor and collects the statistics (`sdr_acc_stat()`): number of
@@ -1521,3 +1531,48 @@ prn` every 1 s).
   184 at 60 s). Both configs reach the limit at ~260-290 channels: the NPU
   saves 3-4 points of CPU but not the maximum channels, which is set by the
   tracking on the CPU and reduced by the NPU memory interference.
+
+### 14.9 Hailo-10H (Raspberry Pi 5 + AI HAT+ 2)
+
+Plugin `hailo` (`src/sdr_acc_hailo.cpp`, `lib/build/libsdr_acc_hailo.mk`),
+HEFs by `lib/build/gen_hailo_acq.py` (Dataflow Compiler 5.4.0, x86) in
+`lib/linux/hailo`, HailoRT 5.4.0 on Raspberry Pi 5 (Debian 13, PCIe Gen3 x1).
+
+- Model: carrier folded four-step DFT of Kc = 7 bins per frame (bins in the
+  channels, batch 1), code multiplication, IDFT and the correlation power on
+  the NPU (two copies of the last IDFT outputs multiplied element-wise, 16-bit
+  tail; the `square` layer is 8-bit only). The host prepares the uint8 inputs
+  (carrier wipe-off of the first bin, RMS normalization) and accumulates the
+  uint16 powers. Kc > 1 is only possible with the bins in the channels (the
+  Reshape of the batch dimension is not supported by the parser).
+- Throughput (`hailortcli run2`): multi-context HEFs gain much from batching
+  (Kc = 7: 305 -> 810 frames/s at batch 16, ~5,700 bin-ms/s); single-context
+  HEFs (Kc = 1) do not (~715 frames/s, I/O ~200 MB/s). PCIe Gen2 and Gen3 are
+  the same (the link is not the bottleneck). Kc = 21 could not be allocated
+  (no progress for 4.7 h), compiler optimization level max: no gain.
+- The per-call API (one window per call) takes 189 ms per L1CA search (21
+  bins x 13 ms); with all windows of a search in one call (API version 4
+  `search_code_i8_multi()`, batch 8-16) 79 ms (21 bins x 13 ms) or 113 ms (21
+  bins x 20 ms), host CPU ~15 ms, vs 173 ms of RK3588 NPU and ~200 ms of an
+  A76 core (`cpu_opt`).
+- Device output corruption of multi-context HEFs: Kc = 7 / R = 100 (output
+  features 700) and Kc = 3 / R = 100 or 112 (300 / 336) output partly
+  displaced samples on the device (+2 or +B-6 in groups of 8 columns, not in
+  the emulator, independent of the HailoRT format conversion, single-context
+  HEFs correct). For 10.23 Mcps codes 2 samples at 24 MHz are 0.85 chip and
+  the tracking could not pull in. Kc = 7 / R = 112 (M = 48000) and Kc = 7 /
+  R = 64 (M = 16000) are correct for all code offsets; the plugin uses the
+  Kc = 7 model also for K < 7 (a frame of Kc = 7 takes about the same time
+  as Kc = 1).
+- Calibration: with L1CA only, the peaks of 10.23 Mcps codes (flat code
+  spectrum normalized by the max magnitude) were clipped (peak 0.13 of the
+  reference at 50 dB-Hz) and the Doppler bin of the max power was often one
+  bin off. With mixed codes (L1CA, L5I, B1I, E5AI, C/N0 30-58 dB-Hz): peak
+  0.97-1.07 up to 55 dB-Hz, C/N0 within 0.2 dB, NRMSE 0.05-0.1 (20 windows).
+- Receiver (Pi 5, 60 s of the 24 MHz data, L1CA/L5I/E5aI/I5S/E5bI 150
+  channels, no decimation): Hailo 365 searches (45 s busy), 33-46 signals
+  found, first sweep in ~25 s; `cpu_opt` 202 searches, 31 signals found (the
+  first sweep not finished). Code offsets and Doppler agree with `cpu_opt`
+  (the same signals found later by `cpu_opt`). The losses of weak signals
+  (L5I 34-37 dB-Hz, L1CA 30 dB-Hz) are the same with `cpu_opt` (6 signals:
+  `cpu_opt` 10 found / 5 lost, Hailo 12 / 6). CPU load ~50% of 4 cores.

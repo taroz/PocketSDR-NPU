@@ -187,6 +187,8 @@ typedef struct {                // signal acquisition type
     int fd_ext_n;               // number of Doppler bins for fd_ext (0=3)
     float *P_sum;               // sum of correlation powers
     int n_sum;                  // number of sum
+    int *ix_sum;                // buffer indices of deferred windows [n_sum]
+                                // (multi-window search by accelerator)
 } sdr_acq_t;
 
 typedef struct {                // signal tracking type
@@ -591,6 +593,10 @@ void sdr_acc_stat(sdr_acc_stat_t *stat, int reset);
 int sdr_acc_search_code(const sdr_cpx_t *code_fft, double T,
     const sdr_buff_t *buff, int ix, int N, int Nmax, double fs, double fi,
     const float *fds, int len_fds, float *P);
+int sdr_acc_search_multi(void);
+int sdr_acc_search_code_multi(const sdr_cpx_t *code_fft, double T,
+    const sdr_buff_t *buff, const int *ix, int NW, int N, int Nmax, double fs,
+    double fi, const float *fds, int len_fds, float *P);
 int sdr_acc_trk_init(const char *backend);
 void sdr_acc_trk_exit(void);
 int sdr_acc_trk_type(const char **name);
