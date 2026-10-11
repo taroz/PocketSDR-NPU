@@ -55,6 +55,11 @@
 //  bins in 9/21 chunks of 23/20 bins), and the chunks are processed in rounds
 //  of the NPU cores.
 //
+//  All windows of an acquisition are searched in one call by
+//  search_code_i8_multi() (API version 4): the chunks of all windows are
+//  processed without waiting for the other workers at each window (worker i:
+//  chunks i, i + nw, ... of the windows).
+//
 //  The DFTs are unitary and the inputs are normalized to unit RMS to keep the
 //  values inside the FP16 range (the model output powers are scaled by 1/64).
 //  The INT8 models (_fq) keep the final DFT (F_A^-1) and the powers in FP16.
@@ -91,6 +96,7 @@
 //                   DFT factorization with B % 4 = 0 (M=320000: 500x640)
 //                   shared DFT models (_s) by default, add option noshift
 //                   fix tolerance of uniform Doppler bins (single precision)
+//  2026-10-11  1.3  multi-window search (API version 4)
 //
 #include <algorithm>
 #include <chrono>
@@ -200,11 +206,17 @@ struct worker_t {
     std::map<std::tuple<int, int, int>, std::unique_ptr<model_t>> models;
     std::map<std::tuple<int, int, int, int>, std::unique_ptr<rmodel_t>> rmodels;
     std::vector<f16_t> ab;  // separable carrier of bin
-    const call_t *call = NULL;
     int k0 = 0;             // first bin of chunk
     int ok = 0;
     double t[9] = {0};      // profile of steps (thread CPU time) (s)
     std::vector<f16_t> cs;  // code DFT with wrapped rows (shift mode)
+};
+
+// job of code search (windows x chunks, shared by workers) --------------------
+//   worker i runs the chunks i, i + nw, ... of all windows (disjoint bins of P)
+struct job_t {
+    std::vector<call_t> calls; // calls of windows
+    int nch = 0, nw = 0;    // chunks per window, active workers
 };
 
 static int ncore = MAX_CORE;
@@ -225,6 +237,7 @@ static std::mutex &wk_mtx = *new std::mutex;
 static std::condition_variable &wk_cv = *new std::condition_variable;
 static std::condition_variable &done_cv = *new std::condition_variable;
 static int wk_gen = 0, wk_pend = 0, wk_quit = 0, wk_nact = 0;
+static job_t *wk_job = NULL;
 static uint64_t ncall = 0;
 
 // current time (s) ------------------------------------------------------------
@@ -1029,20 +1042,33 @@ static int run_chunk(worker_t *w, const call_t *c)
     return 1;
 }
 
+// run job by worker -------------------------------------------------------------
+static int run_job(worker_t *w, job_t *j)
+{
+    int ok = 1, nwin = (int)j->calls.size();
+    for (int i = 0; i < nwin && ok; i++) {
+        for (int ch = w->id; ch < j->nch && ok; ch += j->nw) {
+            w->k0 = ch * j->calls[i].Kc;
+            ok &= run_chunk(w, &j->calls[i]);
+        }
+    }
+    return ok;
+}
+
 // worker thread function ------------------------------------------------------
 static void worker_func(worker_t *w)
 {
     int gen = 0;
     for (;;) {
-        const call_t *c;
+        job_t *j;
         {
             std::unique_lock<std::mutex> lock(wk_mtx);
             wk_cv.wait(lock, [&] { return wk_quit || wk_gen != gen; });
             if (wk_quit) return;
             gen = wk_gen;
-            c = w->id < wk_nact ? w->call : NULL;
+            j = w->id < wk_nact ? wk_job : NULL;
         }
-        if (c) w->ok = run_chunk(w, c);
+        if (j) w->ok = run_job(w, j);
         std::lock_guard<std::mutex> lock(wk_mtx);
         if (--wk_pend == 0) done_cv.notify_one();
     }
@@ -1164,18 +1190,21 @@ static uint64_t code_sig(const float *code, int M)
     return h;
 }
 
-// parallel code search --------------------------------------------------------
-static int search_code(const float *x, const int8_t *x8, const float *code,
-    int M, double fs, const double *fc, int K, int nout, float *P, int ldP,
-    sdr_acc_prof_t *prof)
+// parallel code search of windows ----------------------------------------------
+static int search_code(const float **xs, const int8_t **x8s, int NW,
+    const float *code, int M, double fs, const double *fc, int K, int nout,
+    float *P, int ldP, sdr_acc_prof_t *prof)
 {
     int A, B;
-    if (nref <= 0 || nout > M || K < 1 || !factorize(M, &A, &B)) return 0;
+    if (nref <= 0 || NW < 1 || nout > M || K < 1 || !factorize(M, &A, &B)) {
+        return 0;
+    }
     std::lock_guard<std::mutex> lock(call_mtx);
     double t0 = now();
+    int R = (nout + B - 1) / B;
 
     // Doppler bins per chunk (padded bins extrapolated): nch chunks of Kc bins
-    // (Kc * A <= MAX_KCH) processed by nw workers in rounds
+    // (Kc * A <= MAX_KCH) processed by nw workers in turn
     int nw = std::min(ncore, K), kmax = std::max(1, MAX_KCH / A);
     int nch = std::max(nw, (K + kmax - 1) / kmax);
     nch = (nch + nw - 1) / nw * nw;
@@ -1188,23 +1217,9 @@ static int search_code(const float *x, const int8_t *x8, const float *code,
         fcc[k] = k < K ? fc[k] : fc[K-1] + (k - K + 1) *
             (K > 1 ? fc[1] - fc[0] : 0.0);
     }
-    // IF samples [B][A] (n2, n1) and code DFT [A][B] (k1, k2) scaled to unit RMS
-    static std::vector<f16_t> xt;
+    // code DFT [A][B] (k1, k2) scaled to unit RMS
     static std::vector<f16_t> ct;
-    xt.resize(2 * (size_t)M);
     ct.resize(2 * (size_t)M);
-    double sx = 0.0;
-    for (int i = 0; i < 2 * M; i++) {
-        double v = x ? x[i] : x8[i];
-        sx += v * v;
-    }
-    if (sx <= 0.0) return 0;
-    float s_x = (float)std::sqrt(M / sx);
-    for (int n1 = 0; n1 < A; n1++) for (int n2 = 0; n2 < B; n2++) {
-        size_t i = (size_t)B * n1 + n2, j = (size_t)n2 * A + n1;
-        xt[j] = (f16_t)((x ? x[i*2] : x8[i*2]) * s_x);
-        xt[j+M] = (f16_t)((x ? x[i*2+1] : x8[i*2+1]) * s_x);
-    }
     static const float *code_p = NULL;
     static uint64_t code_gen = 0, code_h = 0;
     static int code_M = 0;
@@ -1229,41 +1244,61 @@ static int search_code(const float *x, const int8_t *x8, const float *code,
         code_M = M;
         code_gen++;
     }
-    double s = 1.0 / ((double)s_x * s_c * M);
-    call_t c = {M, A, B, Kc, (nout + B - 1) / B, nout, ldP, fs, fcc.data(),
-        K, xt.data(), ct.data(), code_gen, cmax, dop_step(M, fs, fcc.data(),
-        Kc * nch), get_table(M, A, B), P, (float)(s * s)};
+    // IF samples [B][A] (n2, n1) of windows scaled to unit RMS
+    static std::vector<std::vector<f16_t>> xts;
+    if ((int)xts.size() < NW) xts.resize(NW);
+    static job_t job;
+    job.calls.clear();
+    const table_t *tab = get_table(M, A, B);
+    int S = dop_step(M, fs, fcc.data(), Kc * nch);
+    for (int w = 0; w < NW; w++) {
+        const float *x = xs ? xs[w] : NULL;
+        const int8_t *x8 = x8s ? x8s[w] : NULL;
+        std::vector<f16_t> &xt = xts[w];
+        xt.resize(2 * (size_t)M);
+        double sx = 0.0;
+        for (int i = 0; i < 2 * M; i++) {
+            double v = x ? x[i] : x8[i];
+            sx += v * v;
+        }
+        if (sx <= 0.0) return 0;
+        float s_x = (float)std::sqrt(M / sx);
+        for (int n1 = 0; n1 < A; n1++) for (int n2 = 0; n2 < B; n2++) {
+            size_t i = (size_t)B * n1 + n2, j = (size_t)n2 * A + n1;
+            xt[j] = (f16_t)((x ? x[i*2] : x8[i*2]) * s_x);
+            xt[j+M] = (f16_t)((x ? x[i*2+1] : x8[i*2+1]) * s_x);
+        }
+        double s = 1.0 / ((double)s_x * s_c * M);
+        job.calls.push_back({M, A, B, Kc, R, nout, ldP, fs, fcc.data(), K,
+            xt.data(), ct.data(), code_gen, cmax, S, tab, P, (float)(s * s)});
+    }
+    job.nch = nch;
+    job.nw = nw;
     double t1 = now();
 
-    // run workers (rounds of nw chunks)
-    int ok = 1;
-    for (int r0 = 0; r0 < nch && ok; r0 += nw) {
-        int na = std::min(nw, nch - r0);
-        {
-            std::lock_guard<std::mutex> lk(wk_mtx);
-            for (int i = 0; i < na; i++) {
-                workers[i].call = &c;
-                workers[i].k0 = (r0 + i) * Kc;
-                workers[i].ok = 0;
-            }
-            wk_nact = na;
-            wk_pend = ncore;
-            wk_gen++;
-        }
-        wk_cv.notify_all();
-        {
-            std::unique_lock<std::mutex> lk(wk_mtx);
-            done_cv.wait(lk, [] { return wk_pend == 0; });
-        }
-        for (int i = 0; i < na; i++) ok &= workers[i].ok;
+    // run workers
+    {
+        std::lock_guard<std::mutex> lk(wk_mtx);
+        for (int i = 0; i < nw; i++) workers[i].ok = 0;
+        wk_job = &job;
+        wk_nact = nw;
+        wk_pend = ncore;
+        wk_gen++;
     }
-    ncall++;
+    wk_cv.notify_all();
+    {
+        std::unique_lock<std::mutex> lk(wk_mtx);
+        done_cv.wait(lk, [] { return wk_pend == 0; });
+    }
+    int ok = 1;
+    for (int i = 0; i < nw; i++) ok &= workers[i].ok;
+    ncall += NW;
     if (prof) {
         prof->t_in = t1 - t0;
         prof->t_exec = now() - t1;
         prof->t_out = 0.0;
-        prof->bytes_in = 2.0 * 2.0 * Kc * nch * M;
-        prof->bytes_out = 2.0 * 2.0 * Kc * nch * c.R * B;
+        prof->bytes_in = 2.0 * 2.0 * Kc * nch * M * NW;
+        prof->bytes_out = 2.0 * 2.0 * Kc * nch * R * B * NW;
     }
     return ok;
 }
@@ -1273,7 +1308,7 @@ static int rk_search_code(const float *x, const float *code, int M,
     double fs, const double *fc, int K, int nout, float *P, int ldP,
     sdr_acc_prof_t *prof)
 {
-    return search_code(x, NULL, code, M, fs, fc, K, nout, P, ldP, prof);
+    return search_code(&x, NULL, 1, code, M, fs, fc, K, nout, P, ldP, prof);
 }
 
 // parallel code search (int8 IF samples) -------------------------------------
@@ -1281,7 +1316,15 @@ static int rk_search_code_i8(const int8_t *x, const float *code, int M,
     double fs, const double *fc, int K, int nout, float *P, int ldP,
     sdr_acc_prof_t *prof)
 {
-    return search_code(NULL, x, code, M, fs, fc, K, nout, P, ldP, prof);
+    return search_code(NULL, &x, 1, code, M, fs, fc, K, nout, P, ldP, prof);
+}
+
+// parallel code search of windows (int8 IF samples) ----------------------------
+static int rk_search_code_i8_multi(const int8_t **x, int NW, const float *code,
+    int M, double fs, const double *fc, int K, int nout, float *P, int ldP,
+    sdr_acc_prof_t *prof)
+{
+    return search_code(NULL, x, NW, code, M, fs, fc, K, nout, P, ldP, prof);
 }
 
 // plugin entry point ----------------------------------------------------------
@@ -1289,7 +1332,7 @@ extern "C" const sdr_acc_plugin_t *sdr_acc_plugin(void)
 {
     static const sdr_acc_plugin_t plugin = {
         SDR_ACC_API_VER, "rknn", rk_init, rk_exit, rk_search_code,
-        NULL, rk_search_code_i8
+        NULL, rk_search_code_i8, rk_search_code_i8_multi
     };
     return &plugin;
 }

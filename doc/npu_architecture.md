@@ -1602,7 +1602,70 @@ HEFs by `lib/build/gen_hailo_acq.py` (Dataflow Compiler 5.4.0, x86) in
 | 200 | Hailo (no E1B model) | 53 s | 18% | 186 / 342 | 95% |
 
 - With the E1B model the searches falling back to the CPU drop from 1257 to
-  217 (N=100), and the receiver keeps the real time at N=100. The real-time
-  limit of the Pi 5 is ~100-130 channels with or without the NPU: the
-  tracking correlators saturate the 4 A76 cores, as on the RK3588 (13.14),
-  and the all-in-view set (~190-200 signals) is not possible in real time.
+  217 (N=100), and the receiver keeps the real time at N=100. By the lag of
+  the file input (no `-rcv_prio`) the real-time limit of the Pi 5 is ~130-145
+  channels with or without the NPU (N=145: 5 s lag for both); see 14.10 for
+  the live-like evaluation (~145 channels): the tracking correlators
+  saturate the 4 A76 cores, as on the RK3588 (13.14), and the all-in-view set
+  (~190-200 signals) is not possible in real time.
+- Multi-window search for the RKNN plugin (API version 4, the chunks of all
+  windows without the barrier at each window; tried and removed: windows in
+  parallel with all bins of a window in one chunk, model 48000:21:100 `_s`):
+  the same powers as the per-window calls (diff 0-4e-4), L1CA (21 bins x 20
+  windows) per-window / chunk parallel / window parallel 147 / 146 / 149 ms
+  on an A76, 187 / 182 / 178 ms on the A55, E1B 744 / 741 / 757 ms. The
+  on-chip NPU with zero-copy buffers has little overhead per call, and the
+  search is bound by the NPU memory bandwidth (13.3), so the multi-window
+  search that made Hailo 2.4x faster gains only 1-5% on the RK3588.
+
+### 14.10 Live-like capacity of ROCK 5B and Pi 5
+
+The same evaluation on both boards: 300 s of the 24 MHz data, `-rcv_prio 10`
+(input in real time, an overload shows as the IF buffer usage > 100%), the
+signal sets `capn_N.sh` (`gen_cap.py`, fixed seed: N tracked + 142 search
+channels), decimation `-dec 1:3:7.42,1:3:-6.902,2:3`, `cpu_opt` of the FFTW
+build with the FFTW wisdom of the board, CPU governor `performance` (ROCK also
+DDR and NPU). ROCK: rknn with the search on the A55 (`-cpu_acq 0-3 -cpu_trk
+0-7`); Pi 5: no CPU affinity. Max BUFF (10 s samples), LOCK at 30 s / 60 s /
+end:
+
+| board | N | NPU | `cpu_opt` |
+|---|---|---|---|
+| Pi 5 + Hailo-10H | 130 | 15%, 99 / 101 / **122** | 19%, 75 / 97 / 112 |
+| Pi 5 + Hailo-10H | 145 | 35%, 91 / 111 / 131 | 63%, 74 / 105 / 131 |
+| Pi 5 + Hailo-10H | 160 | 99%, 96 / 122 / **137** | 93%, 75 / 105 / 126 |
+| ROCK 5B (RK3588) | 220 | 7%, 92 / 162 / 210 | 13%, 101 / 178 / 208 |
+| ROCK 5B (RK3588) | 240 | 81% (one sample), 97 / 159 / 228 | 16%, 106 / 189 / 227 |
+| ROCK 5B (RK3588) | 260 | **112%**, 101 / 168 / 242 | 25%, 103 / 189 / 236 |
+| ROCK 5B (RK3588) | 290 | **134%**, 99 / 164 / 253 | **109%**, 104 / 188 / 246 |
+
+(ROCK rknn at N=260 without CPU affinity: 185%. CPU: Pi 5 94-102%, ROCK
+89-96%. User CPU time: Pi 5 17.2-18.1 min, ROCK 32.7-35.5 min per 5 min.)
+
+Pi 5 N=160 again with the IF buffer usage of the tracking and the search
+channels (`-LOG_LEVEL=4`, 1 s): Hailo: the tracking channels within 6% until
+140 s, then rising with the locks (123 at 150 s -> 141 at 240 s) to 119% at
+260-280 s (LOCK 138 at the end, max BUFF 118%); `cpu_opt`: the tracking
+channels 31-56% at 60-120 s and 82-104% after 120 s, the search channel (E1B)
+behind by 100-138% after 200 s (LOCK 127, max BUFF 100%). Both overflow at
+N=160 (the 10 s samples of the monitor missed the peaks): the NPU frees the
+CPU in the first phase (search of the 1 ms codes and E1B/E1C on the NPU) and
+then fills it with the tracking of more locked signals.
+
+- Real-time limit: Pi 5 ~145 channels with both backends (N=160 overflows
+  with both); ROCK 5B ~240-260 with the NPU and ~260-290 with `cpu_opt` (as
+  14.8: the NPU memory traffic slows the memory bound tracking by ~5%).
+- The NPU does not increase the number of channels tracked in real time on
+  either board: the limit is set by the tracking correlators on the CPU (4
+  A76 of the Pi 5, 4 A76 + 4 A55 of the RK3588), and the search uses at most
+  one core on both.
+- Pi 5: the Hailo receiver locks faster (30 s: 91-99 vs 74-75 locks) and more
+  signals at the end near the limit (+9% at N=130 and 160): the search of a 1
+  ms code takes 113 ms on Hailo vs ~270 ms of `cpu_opt` on an A76 of the Pi 5.
+- ROCK 5B: the NPU receiver locks slower in the first minute (60 s: 159-168
+  vs 178-189 locks), since the search with the host on the A55 (L1CA 177 ms,
+  E1B 795 ms per search, 13.14) is slower than `cpu_opt` on an A76 (129 /
+  625 ms), and slightly more signals at the end (+1-3%, the CPU search slows
+  down with the tracking on all cores near the limit).
+- The lag of the file input without `-rcv_prio` (14.9) underestimates the
+  limit of the Pi 5 only slightly (130-145 vs ~145 channels).

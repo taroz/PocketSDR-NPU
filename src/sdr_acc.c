@@ -28,7 +28,8 @@
 //  2026-10-03  1.1  add tracking correlator backends (batched correlator)
 //  2026-10-08  1.2  cpu_mt: default threads = CPUs of the thread affinity
 //  2026-10-11  1.3  add sdr_acc_search_multi(), sdr_acc_search_code_multi()
-//                   plugin: CPU optimized for unsupported shapes
+//                   plugin: CPU optimized for unsupported shapes (counted
+//                   as fallbacks)
 //
 #if !defined(WIN32) && !defined(_GNU_SOURCE)
 #define _GNU_SOURCE         // sched_getaffinity()
@@ -341,10 +342,10 @@ static int search_code_plugin(const sdr_cpx_t *code_fft, const sdr_buff_t *buff,
     return stat;
 }
 
-// parallel code search by CPU optimized ---------------------------------------
+// parallel code search by CPU optimized (stat: update statistics) -------------
 static int search_code_opt(const sdr_cpx_t *code_fft, const sdr_buff_t *buff,
     int ix, int N, int Nmax, double fs, double fi, const float *fds,
-    int len_fds, float *P)
+    int len_fds, float *P, int stat)
 {
     sdr_acc_prof_t prof = {0};
     double t0 = acc_time();
@@ -354,7 +355,7 @@ static int search_code_opt(const sdr_cpx_t *code_fft, const sdr_buff_t *buff,
     for (int i = 0; i < len_fds; i++) {
         double s = (fds[i] - fds[0]) * N / fs;
         if (fabs(s - floor(s + 0.5)) > 1e-6) {
-            update_stat(0, 0.0, 0.0, &prof);
+            if (stat) update_stat(0, 0.0, 0.0, &prof);
             return 0;
         }
         sft[i] = (((int)floor(s + 0.5)) % N + N) % N;
@@ -370,7 +371,7 @@ static int search_code_opt(const sdr_cpx_t *code_fft, const sdr_buff_t *buff,
         X[N+i][1] = IQ[i].Q * SDR_CSCALE;
     }
     if (!sdr_cpx_fft(X + N, N, SDR_FFT_FORWARD, X)) {
-        update_stat(0, 0.0, 0.0, &prof);
+        if (stat) update_stat(0, 0.0, 0.0, &prof);
         return 0;
     }
     for (int i = 0; i < len_fds; i++) {
@@ -391,7 +392,7 @@ static int search_code_opt(const sdr_cpx_t *code_fft, const sdr_buff_t *buff,
     }
     double t = acc_time() - t0;
     prof.t_exec = t;
-    update_stat(1, t, 0.0, &prof);
+    if (stat) update_stat(1, t, 0.0, &prof);
     return 1;
 }
 
@@ -413,12 +414,13 @@ int sdr_acc_search_code(const sdr_cpx_t *code_fft, double T,
     }
     if (acc_type == SDR_ACC_CPUOPT) {
         return search_code_opt(code_fft, buff, ix, N, Nmax, fs, fi, fds,
-            len_fds, P);
+            len_fds, P, 1);
     }
     if (acc_type == SDR_ACC_PLUGIN) { // CPU optimized if not supported
+        // (counted as a fallback of the plugin)
         return search_code_plugin(code_fft, buff, ix, N, Nmax, fs, fi, fds,
             len_fds, P) || search_code_opt(code_fft, buff, ix, N, Nmax, fs, fi,
-            fds, len_fds, P);
+            fds, len_fds, P, 0);
     }
     return 0;
 }
