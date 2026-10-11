@@ -3,7 +3,7 @@
 #  generate RKNN models of parallel code search for Rockchip NPU plugin
 #  (libsdr_acc_rknn.so)
 #
-#  usage: gen_rknn_acq.py [-o dir] [-t target] [-w|-f|-q|-s] [-fs fs] M:Kc[:R] ...
+#  usage: gen_rknn_acq.py [-o dir] [-t target] [-w|-f|-q|-s|-s -q] [-fs fs] M:Kc[:R] ...
 #
 #    M  : DFT size (2 x samples per code period)
 #    Kc : Doppler bins per inference (= ceil(K / NPU cores), K: bins of search)
@@ -23,7 +23,8 @@
 #         [Kc][k2][1][k1]); the forward DFT of the IF samples is computed once
 #         and shared by the bins (|IDFT(X[m+k] C[m])| = |IDFT(X[m] C[m-k])|)
 #         (model name: acq_M<M>_K<Kc>_R<R>_s.rknn)
-#    -q : INT8 model of -f (acq_M<M>_K<Kc>_R<R>_fq.rknn): all ops INT8 except
+#    -q : INT8 model of -f (acq_M<M>_K<Kc>_R<R>_fq.rknn) or of -s with -s -q
+#         (acq_M<M>_K<Kc>_R<R>_sq.rknn, calibrated by the rolled code): all ops INT8 except
 #         the last IDFT stage F_A^-1 and the correlation power (FP16) (hybrid
 #         quantization), calibrated by synthetic signals (C/N0 30-60 dB-Hz) of the
 #         codes of the period M / 2 / fs (-fs: sampling frequency in MHz,
@@ -306,8 +307,11 @@ def build_onnx_shift(A, B, Kc, R):
     sr, si = op('Transpose', [sr], perm=perm), op('Transpose', [si], perm=perm)
     if flat:
         sr, si = reshape(sr, [Kc, A, 1, B]), reshape(si, [Kc, A, 1, B])
-    orr, oi = cconv(sr, si, dft(A, 1, range(R)) / 8.0)  # [Kc][p1][1][p2]
-    op('Add', [op('Mul', [orr, orr]), op('Mul', [oi, oi])])
+    nodes[-2].output[0], nodes[-1].output[0] = 'Sr', 'Si' # (for hybrid quant.)
+    orr, oi = cconv('Sr', 'Si', dft(A, 1, range(R)) / 8.0)  # [Kc][p1][1][p2]
+    nodes[-3].output[0] = 'Or'  # (named for hybrid quantization)
+    nodes[-1].output[0] = 'Oi'
+    op('Add', [op('Mul', ['Or', 'Or']), op('Mul', ['Oi', 'Oi'])])
     nodes[-1].output[0] = 'P'
     outs = [h.make_tensor_value_info('P', T.FLOAT, [Kc, R, 1, B])]
     g = h.make_graph(nodes, 'sdr_acq_s', ins, outs, inits)
@@ -362,7 +366,7 @@ CAL_SIGS = ['L1CA', 'B1I', 'G1CA', 'L5I', 'E5AI', 'E6B', 'E1B', 'L6D', 'L1CP',
 CAL_PRN = {'G1CA': list(range(-7, 7)), 'G2CA': list(range(-7, 7)),
     'L6D': list(range(193, 203)), 'L6E': list(range(203, 212))}
 
-def gen_calib(A, B, Kc, fs, ncal, dir):
+def gen_calib(A, B, Kc, fs, ncal, dir, shift=False):
     sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)),
         '..', '..', 'python'))
     import sdr_code
@@ -393,8 +397,15 @@ def gen_calib(A, B, Kc, fs, ncal, dir):
         c = sdr_code.gen_code_fft(code, T, 0.0, fs, N, N)
         c /= np.max(np.abs(c))
         xs = x.reshape(1, A, 1, B)
-        cs = c.reshape(B, A)
-        cs = (np.tile(cs, (1, W // A)))[None, :, None, :]
+        if shift: # code DFT rolled by bin: C[(k1+A*k2-k) mod M]
+            cs = np.stack([np.roll(c, k).reshape(B, A) for k in range(Kc)])
+            if Kc * A <= MAX_W:
+                cs = cs.transpose(1, 0, 2).reshape(1, B, 1, Kc * A)
+            else:
+                cs = cs[:, :, None, :]
+        else:
+            cs = c.reshape(B, A)
+            cs = (np.tile(cs, (1, W // A)))[None, :, None, :]
         fs_ = []
         for k, v in [('xr', xs.real), ('xi', xs.imag), ('cr', cs.real), ('ci', cs.imag)]:
             f = os.path.join(dir, '%s_%d.npy' % (k, i))
@@ -435,13 +446,13 @@ NCAL = int(os.environ.get('RKNN_NCAL', '64'))     # calibration samples
 CAL_CN0 = float(os.environ.get('RKNN_CAL_CN0', '60'))  # max C/N0 (dB-Hz)
 QFLOAT = os.environ.get('RKNN_QFLOAT', 'F')   # FP16 part: F (IDFT F_A^-1 + power), P (power)
 
-def build_quant(name, A, B, Kc, fs, target):
+def build_quant(name, A, B, Kc, fs, target, shift=False):
     import tempfile, shutil
     from rknn.api import RKNN
     cwd = os.getcwd()
     tmp = tempfile.mkdtemp(prefix='rknn_q_')
     try:
-        ds = gen_calib(A, B, Kc, fs, NCAL, os.path.join(tmp, 'cal'))
+        ds = gen_calib(A, B, Kc, fs, NCAL, os.path.join(tmp, 'cal'), shift)
         shutil.copy(name + '.onnx', os.path.join(tmp, 'm.onnx'))
         os.chdir(tmp)
         r = RKNN(verbose=False)
@@ -500,7 +511,7 @@ def main(argv):
             continue
         R = s[2] if len(s) > 2 else A // 2
         name = os.path.join(outdir, 'acq_M%d_K%d_R%d%s' % (M, Kc, R,
-            '_s' if shift else ('_fq' if quant else ('_f' if fold else
+            ('_sq' if quant else '_s') if shift else ('_fq' if quant else ('_f' if fold else
             ('_w' if wipe else '')))))
         if shift:
             onnx.save(build_onnx_shift(A, B, Kc, R), name + '.onnx')
@@ -514,7 +525,7 @@ def main(argv):
         print('M=%d (A=%d B=%d) Kc=%d R=%d: ONNX vs FFT NRMSE=%.2e' % (M, A,
             B, Kc, R, e))
         if quant:
-            build_quant(name, A, B, Kc, fs, target)
+            build_quant(name, A, B, Kc, fs, target, shift)
         else:
             r = RKNN(verbose=False)
             r.config(target_platform=target, optimization_level=3)

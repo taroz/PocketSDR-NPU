@@ -1669,3 +1669,74 @@ then fills it with the tracking of more locked signals.
   down with the tracking on all cores near the limit).
 - The lag of the file input without `-rcv_prio` (14.9) underestimates the
   limit of the Pi 5 only slightly (130-145 vs ~145 channels).
+
+### 14.11 Fair capacity, INT8 shared DFT and direct search of long codes
+
+**Capacity with `-trk_guard 20`** (no new search while the IF buffer usage of
+the tracking channels > 20%, so the CPU freed by the NPU goes to the
+tracking; settings of 14.10, buffer usage of the tracking (TRK) and search
+(SRCH) channels by the debug log (`-LOG_LEVEL=4`) every 1 s, TRK max / seconds
+> 100% / LOCK at 30 s / 60 s / end):
+
+| board | N | NPU | `cpu_opt` |
+|---|---|---|---|
+| Pi 5 + Hailo-10H | 145 | 44% / 0 s / 95 / 117 / **134** | 95% / 0 s / 79 / 109 / 129 |
+| Pi 5 + Hailo-10H | 160 | 102% / 4 s / 96 / 124 / 143 | 57% / 0 s (SRCH 125%) / 73 / 98 / 123 |
+| Pi 5 + Hailo-10H | 175 | 110% / 7 s / 101 / 131 / 133 | 124% / 8 s / 75 / 110 / 133 |
+| Pi 5, Hailo plugin 1.2 (long codes on the NPU) | 145 / 160 / 175 | 46% / 87% / 105% (9 s), LOCK end 133 / 131 / 133, 30 s 111 / 106 / 110 | |
+| ROCK 5B rknn (FP16 `_s`, A55 acq) | 260 | 79% / 0 s / 98 / 164 / 238 | 22% / 0 s / 102 / 184 / 236 |
+| ROCK 5B rknn (FP16 `_s`, A55 acq) | 290 | 135% / 5 s / 96 / 164 / 251 | 101% / 2 s / 100 / 182 / 241 |
+| ROCK 5B rknn:int8 (`_sq`, A55 acq) | 260 | 47% / 0 s / 105 / 173 / 240 | |
+| ROCK 5B rknn:int8 (`_sq`, A55 acq) | 290 | 106% / 11 s / 107 / 174 / 247 | |
+| ROCK 5B rknn:int8, search host on the A76 (`-cpu_acq 4-7`) | 260 / 290 | 155% (7 s) / 122% (6 s), LOCK 30 s 143 / 140, 60 s **221 / 234**, end 240 / 255 | |
+
+- The maximum number of signals tracked in real time: Pi 5 ~134-140 with
+  Hailo vs ~129 with `cpu_opt` (+4-8%, single runs); ROCK 5B ~240-250 for
+  all (no difference). The NPU locks faster on the Pi 5 (30 s: 95-111 vs
+  73-79); on the ROCK 5B the search with the host on the A55 locks slower in
+  the first minute than `cpu_opt` on an A76 (60 s: 164-174 vs 182-184). With
+  the search host on the A76 the NPU receiver locks much faster (60 s:
+  221-234, +20-27% vs `cpu_opt`) but the search competes with the tracking on
+  the A76 (TRK overflow 6-7 s at N=260 / 290): a trade-off of the time to lock
+  and the capacity set by the core assignment.
+
+**INT8 shared DFT models for RKNN** (`_sq`, `gen_rknn_acq.py -s -q`:
+calibrated by the code DFT rolled by bin; plugin option `int8`: `_sq`, then
+`_fq`): vs FP16 `_s` NRMSE 0.07-0.13, C/N0 within 0.3 dB, same peaks (random
+codes); `test_sdr_acc` PASS (NRMSE 0.05 / 0.13).
+
+**Search time per signal on the real data** (`bench_sdr_acq` with `-dec` and
+the multi-window search of the backend, 4-8 PRNs per signal, the same
+detections for all backends; time / CPU time in ms; ROCK on one core
+(`taskset`), Pi 5 on all cores):
+
+| signal (fs, code) | ROCK A76 `cpu_opt` | ROCK A76 rknn `_s` | ROCK A76 rknn:int8 | ROCK A55 `cpu_opt` | ROCK A55 rknn:int8 | Pi 5 `cpu_opt` | Pi 5 Hailo |
+|---|---|---|---|---|---|---|---|
+| L1CA (24 MHz, 1 ms) | 204 / 204 | 165 / 39 | **138 / 38** | 957 | 223 / 147 | 202 / 202 | **137 / 70** |
+| L5I (24 MHz, 1 ms) | 204 / 204 | 161 / 35 | 134 / 34 | 955 | 213 / 137 | 199 / 199 | **108 / 69** |
+| L1CA (8 MHz, 1 ms) | 51 / 51 | 72 / 15 | 52 / 15 | 257 | 86 / 60 | **50** / 50 | 76 / **28** |
+| E1B (8 MHz, 4 ms) | 294 / 278 | 279 / 72 | **190 / 57** | 1484 | 309 / 182 | 276 / 260 | **236 / 88** |
+| L1CP direct (8 MHz, 10 ms, 201 bins) | 891 / 871 | 797 / 228 | **563 / 178** | 4205 | 823 / 465 | 1118 / 1099 | **751 / 411** |
+| L2CM direct (8 MHz, 20 ms, 401 bins) | 2620 / 2601 | 1806 / 458 | **1246 / 388** | 13124 | 1735 / 948 | 3026 / 3007 | **2408 / 922** |
+
+(ROCK long codes with the models 160000:34:200 and 320000:27:250 of the chunks
+of 201 / 401 bins; without them the matmul API: L1CP 1037 / 735 ms.)
+
+- The direct search of the long codes is 1.6-2.1x faster with 1/5-1/7 of the
+  CPU time on the RK3588 (INT8, A76) and 1.3-1.5x faster with 1/2.7-1/3.3 of
+  the CPU time on the Hailo-10H; on the A55 the NPU is 5-7.6x faster than
+  `cpu_opt`. The 1 ms codes at 8 MHz are fastest on the CPU (small FFT).
+
+**Hailo plugin 1.2**: the IF samples are wiped by the carrier of the first bin
+once per window and the code DFT is rolled by the first bin of each chunk
+(shared DFT identity, as `_s`), frames run as jobs of one frame: L1CP direct
+812 -> 663 ms (host input preparation 161 -> 16 ms per window), E1B 183 ->
+176 ms, L1CA 113 -> 109 ms (the same powers). (A `Bindings` object erased
+from a `std::vector` shares its state with the copies, which corrupted the
+outputs of queued jobs; the bindings are not erased.) Long-code HEFs:
+160000:1:200 (L1CP/B1CP/L1CD/B1CD calibration, Kc = 2 not allocatable) correct
+for all code offsets; 320000:1:250 (L2CM) outputs the first row (lags 0-641
+of 160000) displaced by up to 2 samples (R = 256 / 264: also row 125), used
+with this limitation (2 samples = 0.13 chip of L2CM at 8 MHz). INT8 C/N0 of
+strong L2CM signals (20 ms coherent) ~1 dB lower than `cpu_opt` (also with
+plugin 1.1).

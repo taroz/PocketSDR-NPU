@@ -33,8 +33,12 @@
 //    signals are clipped and the Doppler bin of the max power is wrong.
 //
 //  All windows of an acquisition are searched in one call by
-//  search_code_i8_multi() (the frames of the windows and chunks in one job),
-//  which is much faster with the batch size 8-16 than the call per window.
+//  search_code_i8_multi() (the frames of the windows and chunks queued at
+//  once), which is much faster with the batch size 8-16 than the call per
+//  window. The IF samples are wiped by the carrier of the first bin once per
+//  window and the code DFT is rolled by the first bin of each chunk (shared DFT
+//  identity), which reduces the host CPU time (e.g. L1CP 10 ms direct search:
+//  input preparation 161 -> 16 ms per window).
 //
 //  options: [hef=dir][,batch=n]
 //           batch=n: batch size of the models (default: HailoRT default,
@@ -49,6 +53,8 @@
 //  History:
 //  2026-10-11  1.0  new
 //  2026-10-11  1.1  add model of Kc = 5
+//  2026-10-12  1.2  code DFT rolled by chunk instead of the carrier wipe-off
+//                   of the IF samples per frame (shared DFT identity)
 //
 #include <stdio.h>
 #include <stdlib.h>
@@ -81,9 +87,10 @@ struct hmodel_t {
     std::string out_name;
     int M = 0, Kc = 0, R = 0, A = 0, B = 0;
     float qs[4], qz[4], os = 1.0f, oz = 0.0f; // quantization of inputs/output
-    std::vector<std::vector<uint8_t>> xr, xi;  // per chunk
-    std::vector<uint8_t> cr, ci;
-    std::vector<std::vector<uint16_t>> out;    // per chunk
+    std::vector<std::vector<uint8_t>> xr, xi;  // IF samples per window
+    std::vector<uint8_t> cr, ci;               // code DFT [k1][k2]
+    std::vector<std::vector<uint8_t>> crs, cis; // rolled code DFT (ring)
+    std::vector<std::vector<uint16_t>> out;    // output per frame
 };
 static int batch_size = 0;              // batch size (0: HailoRT default)
 
@@ -216,8 +223,8 @@ static void prep_frame(const hmodel_t *m, const float *x, const int8_t *x8,
 }
 
 // parallel code search of NW windows (non-coherent integration) -------------
-//   the frames (windows x chunks of bins) are prepared by NTHREAD threads and
-//   run asynchronously in groups of the async queue size (batched by HailoRT)
+//   the IF samples of the windows are prepared by NTHREAD threads and the
+//   frames (chunks of bins x windows) run asynchronously (batched by HailoRT)
 #define NTHREAD 3
 static int search_multi(const float **xs, const int8_t **x8s, int NW,
     const float *code, int M, double fs, const double *fc, int K, int nout,
@@ -273,74 +280,82 @@ static int search_multi(const float **xs, const int8_t **x8s, int NW,
         m->ci[k1 * B + k2] = quant(code[2*i+1] / cmax, m->qs[3], m->qz[3]);
     }
     double tA = now();
-    // carrier tables of the chunks (phase 0 at x[0] of each window)
-    std::vector<std::vector<float>> tabs(nch, std::vector<float>(2 * M));
+    // IF samples of the windows wiped by the carrier of the first bin and the
+    // code DFT of chunk c rolled by c * Kc bins (shared DFT identity:
+    // |IDFT(X[m+s] C[m])| = |IDFT(X[m] C[m-s])|), so the host prepares the IF
+    // samples once per window instead of once per frame. Frames f = c * NW + w
+    // (chunk c, window w) run as jobs of one frame (batched by HailoRT, faster
+    // than larger jobs), the code DFT of chunks in a ring of RING slots (a slot
+    // reused after the jobs of its frames are done)
+    const int RING = 32;
+    int nslot = std::min(RING, nch);
+    if ((int)m->xr.size() < NW) { m->xr.resize(NW); m->xi.resize(NW); }
+    for (int w = 0; w < NW; w++) { m->xr[w].resize(M); m->xi[w].resize(M); }
+    if ((int)m->crs.size() < nslot) { m->crs.resize(nslot); m->cis.resize(nslot); }
+    for (int i = 0; i < nslot; i++) { m->crs[i].resize(M); m->cis[i].resize(M); }
+    if ((int)m->out.size() < F) m->out.resize(F);
+    for (int f = 0; f < F; f++) m->out[f].resize((size_t)B * Kc * m->R);
+    std::vector<float> tab(2 * M);
+    carr_table(fc[0] / fs, M, B, tab.data());
     std::vector<std::thread> th;
-    for (int c = 0; c < nch; c++) {
-        th.emplace_back([&, c]() { carr_table(fc[c * Kc] / fs, M, B, tabs[c].data()); });
+    for (int t = 0; t < NTHREAD; t++) {
+        th.emplace_back([&, t]() {
+            for (int w = t; w < NW; w += NTHREAD) {
+                prep_frame(m, xs ? xs[w] : NULL, x8s ? x8s[w] : NULL, tab.data(),
+                    sx[w], m->xr[w].data(), m->xi[w].data());
+            }
+        });
     }
     for (auto &t : th) t.join();
-    // frames f = w * nch + c (window w, chunk c)
-    if ((int)m->xr.size() < F) { m->xr.resize(F); m->xi.resize(F); m->out.resize(F); }
-    auto prep = [&](int f0, int f1) { // prepare frames f0 to f1-1 by threads
-        std::vector<std::thread> tp;
-        for (int t = 0; t < NTHREAD; t++) {
-            tp.emplace_back([&, t]() {
-                for (int f = f0 + t; f < f1; f += NTHREAD) {
-                    int w = f / nch, c = f % nch;
-                    m->xr[f].resize(M); m->xi[f].resize(M);
-                    m->out[f].resize((size_t)B * Kc * m->R);
-                    prep_frame(m, xs ? xs[w] : NULL, x8s ? x8s[w] : NULL,
-                        tabs[c].data(), sx[w], m->xr[f].data(), m->xi[f].data());
-                }
-            });
-        }
-        for (auto &t : tp) t.join();
-    };
-    double tB = now();
-    for (int f = 0; f < F; f++) {
-        m->xr[f].resize(M); m->xi[f].resize(M); m->out[f].resize((size_t)B * Kc * m->R);
-    }
-    std::vector<Bindings> binds;
-    for (int f = 0; f < F; f++) {
-        auto b = m->cim->create_bindings();
-        if (!b) return 0;
-        Bindings bd = b.release();
-        bd.input(m->in_name[0])->set_buffer(MemoryView(m->xr[f].data(), M));
-        bd.input(m->in_name[1])->set_buffer(MemoryView(m->xi[f].data(), M));
-        bd.input(m->in_name[2])->set_buffer(MemoryView(m->cr.data(), M));
-        bd.input(m->in_name[3])->set_buffer(MemoryView(m->ci.data(), M));
-        bd.output(m->out_name)->set_buffer(MemoryView(m->out[f].data(), m->out[f].size() * 2));
-        binds.push_back(bd);
-    }
-    double t1 = now(), tp = 0.0;
-    if (getenv("SDR_ACC_HAILO_DEBUG")) fprintf(stderr, "sdr_acc_hailo: rms/code %.2f tab %.2f bind %.2f ms\n", (tA - t0) * 1e3, (tB - tA) * 1e3, (t1 - tB) * 1e3);
-    auto qs = m->cim->get_async_queue_size();
-    int qn = qs ? (int)qs.value() : 1;
+    double tB = now(), t1 = tB, tp = 0.0;
     std::vector<AsyncInferJob> jobs;
-    const int PG = NTHREAD * 4; // frames per preparation group
-    for (int g0 = 0; g0 < F; g0 += PG) { // prepare and run groups (overlapped with the NPU)
-        int g1 = std::min(F, g0 + PG);
-        double ta = now();
-        prep(g0, g1);
-        tp += now() - ta;
-        if (getenv("SDR_ACC_HAILO_DEBUG")) fprintf(stderr, "sdr_acc_hailo: prep %d-%d %.2f ms\n", g0, g1, (now() - ta) * 1e3);
-        if (getenv("SDR_ACC_HAILO_NOINFER")) continue;
-        for (int f = g0; f < g1; ) {
-            int n = std::min(qn, g1 - f);
-            if (m->cim->wait_for_async_ready(std::chrono::milliseconds(TIMEOUT_MS), n) != HAILO_SUCCESS) {
+    std::vector<int> job_c;  // chunk of the frame of job
+    size_t jdone = 0;
+    int noinfer = getenv("SDR_ACC_HAILO_NOINFER") != NULL;
+    for (int c = 0; c < nch; c++) {
+        int slot = c % nslot;
+        while (jdone < jobs.size() && job_c[jdone] <= c - nslot) { // free the slot
+            if (jobs[jdone].wait(std::chrono::milliseconds(TIMEOUT_MS)) != HAILO_SUCCESS) {
+                fprintf(stderr, "sdr_acc_hailo: inference error\n");
                 return 0;
             }
-            std::vector<Bindings> g(binds.begin() + f, binds.begin() + f + n);
-            auto job = m->cim->run_async(g);
+            jdone++;
+        }
+        double ta = now();
+        // code DFT rolled: C[(k1 + A k2 - s) mod M] = base[k1'][(k2 - r) mod B]
+        int sft = (c * Kc) % M, s1 = sft % A, s2 = sft / A;
+        uint8_t *cr = m->crs[slot].data(), *ci = m->cis[slot].data();
+        for (int k1 = 0; k1 < A; k1++) { // [k1][k2] layout
+            int k1s = k1 >= s1 ? k1 - s1 : k1 - s1 + A, r = (k1 >= s1 ? s2 : s2 + 1) % B;
+            const uint8_t *br = m->cr.data() + (size_t)k1s * B, *bi = m->ci.data() + (size_t)k1s * B;
+            uint8_t *dr = cr + (size_t)k1 * B, *di = ci + (size_t)k1 * B;
+            memcpy(dr + r, br, B - r); memcpy(dr, br + B - r, r);
+            memcpy(di + r, bi, B - r); memcpy(di, bi + B - r, r);
+        }
+        tp += now() - ta;
+        if (noinfer) continue;
+        for (int w = 0; w < NW; w++) {
+            int f = c * NW + w;
+            auto b = m->cim->create_bindings();
+            if (!b) return 0;
+            Bindings bd = b.release();
+            bd.input(m->in_name[0])->set_buffer(MemoryView(m->xr[w].data(), M));
+            bd.input(m->in_name[1])->set_buffer(MemoryView(m->xi[w].data(), M));
+            bd.input(m->in_name[2])->set_buffer(MemoryView(cr, M));
+            bd.input(m->in_name[3])->set_buffer(MemoryView(ci, M));
+            bd.output(m->out_name)->set_buffer(MemoryView(m->out[f].data(), m->out[f].size() * 2));
+            if (m->cim->wait_for_async_ready(std::chrono::milliseconds(TIMEOUT_MS), 1) != HAILO_SUCCESS) {
+                return 0;
+            }
+            auto job = m->cim->run_async({bd});
             if (!job) return 0;
             jobs.push_back(job.release());
-            f += n;
+            job_c.push_back(c);
         }
     }
-    if (getenv("SDR_ACC_HAILO_DEBUG")) fprintf(stderr, "sdr_acc_hailo: F=%d queue=%d\n", F, qn);
-    for (auto &j : jobs) {
-        if (j.wait(std::chrono::milliseconds(TIMEOUT_MS)) != HAILO_SUCCESS) {
+    if (getenv("SDR_ACC_HAILO_DEBUG")) fprintf(stderr, "sdr_acc_hailo: F=%d prep %.2f ms\n", F, (tB - tA + tp) * 1e3);
+    for (size_t i = jdone; i < jobs.size(); i++) {
+        if (jobs[i].wait(std::chrono::milliseconds(TIMEOUT_MS)) != HAILO_SUCCESS) {
             fprintf(stderr, "sdr_acc_hailo: inference error\n");
             return 0;
         }
@@ -356,7 +371,7 @@ static int search_multi(const float **xs, const int8_t **x8s, int NW,
                 int c = k / Kc, kk = k % Kc;
                 float *p = P + (size_t)k * ldP;
                 for (int w = 0; w < NW; w++) {
-                    const uint16_t *o = m->out[w * nch + c].data();
+                    const uint16_t *o = m->out[c * NW + w].data();
                     float osc = (float)(64.0 / ((double)M * M) * sx[w] * sx[w] * cmax * cmax * m->os);
                     float ozp = m->oz;
                     for (int p1 = 0; p1 < Rm; p1++) for (int p2 = 0; p2 < B; p2++) {
@@ -373,7 +388,7 @@ static int search_multi(const float **xs, const int8_t **x8s, int NW,
         prof->t_in = t1 - t0 + tp;
         prof->t_exec = t2 - t1 - tp;
         prof->t_out = t3 - t2;
-        prof->bytes_in = (double)F * 2 * M + 2 * M;
+        prof->bytes_in = (double)F * 4 * M;
         prof->bytes_out = (double)F * B * W * 2;
     }
     return 1;

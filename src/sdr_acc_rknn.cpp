@@ -9,6 +9,7 @@
 //  (1) RKNN model (default): one inference per chunk of bins by a model
 //  precompiled with RKNN-Toolkit2 (lib/build/gen_rknn_acq.py) for the shape
 //  (M, Kc, R), searched in the order:
+//    acq_M<M>_K<Kc>_R<R>_sq.rknn: INT8 of _s (option int8)
 //    acq_M<M>_K<Kc>_R<R>_fq.rknn: INT8 of _f (option int8)
 //    acq_M<M>_K<Kc>_R<R>_s.rknn: shared DFT (shift mode): the forward DFT of
 //      the IF samples (wiped by the carrier of the first bin of the chunk) is
@@ -75,7 +76,8 @@
 //           hostwipe: carrier wipe-off by host (RKNN models acq_*.rknn)
 //           nofold : no carrier folding (RKNN models acq_*_w.rknn with carrier
 //                  wipe-off in the model)
-//           int8   : INT8 models of carrier folding (acq_*_fq.rknn) if exist
+//           int8   : INT8 models of shared DFT or carrier folding (acq_*_sq.rknn,
+//                  acq_*_fq.rknn) if exist
 //           noshift: no shared DFT models (acq_*_s.rknn, code DFT rolled by
 //                  bin, used if exist by default)
 //                  instead of FP16 models (acq_*_f.rknn) (weak to interference)
@@ -97,6 +99,7 @@
 //                   shared DFT models (_s) by default, add option noshift
 //                   fix tolerance of uniform Doppler bins (single precision)
 //  2026-10-11  1.3  multi-window search (API version 4)
+//                   INT8 shared DFT models (_sq, option int8)
 //
 #include <algorithm>
 #include <chrono>
@@ -162,6 +165,7 @@ struct model_t {
 #define RM_FOLD    2        // model kind: carrier folded into DFT (_f)
 #define RM_FOLDQ   3        // model kind: INT8 of RM_FOLD (_fq)
 #define RM_SHIFT   4        // model kind: shared DFT, code rolled by bin (_s)
+#define RM_SHIFTQ  5        // model kind: INT8 of RM_SHIFT (_sq)
 struct rmodel_t {
     rknn_context ctx = 0;
     int nin = 0;
@@ -628,7 +632,7 @@ static rmodel_t *get_rmodel(worker_t *w, int M, int Kc, int R, int kind)
 {
     static const char *names[MAX_MIN] = {"xr", "xi", "cr", "ci", "ar", "ai",
         "br", "bi"};
-    static const char *sfx[] = {"", "_w", "_f", "_fq", "_s"};
+    static const char *sfx[] = {"", "_w", "_f", "_fq", "_s", "_sq"};
     auto key = std::make_tuple(M, Kc, R, kind);
     auto it = w->rmodels.find(key);
     if (it != w->rmodels.end()) return it->second.get(); // NULL: no model
@@ -849,30 +853,41 @@ static void step_wipe_nat(worker_t *w, const call_t *c, rmodel_t *m)
 static void step_code_shift(worker_t *w, const call_t *c, rmodel_t *m)
 {
     int A = c->A, B = c->B, B1 = B + 1;
-    w->cs.resize(2 * (size_t)A * B1);
+    int i8 = m->ia[2].type == RKNN_TENSOR_INT8;
+    size_t es = i8 ? 1 : 2;
+    w->cs.resize(2 * (size_t)A * B1); // (INT8: bytes in the buffer of FP16)
     for (int j = 0; j < 2; j++) {
+        const rknn_tensor_attr &aj = m->ia[2+j];
         f16_t *e = w->cs.data() + (size_t)j * A * B1;
+        int8_t *e8 = (int8_t *)e; // INT8: normalized by max magnitude
         for (int i1 = 0; i1 < A; i1++) {
             const f16_t *ct = c->ct + (size_t)i1 * B * 2 + j;
-            f16_t *r = e + (size_t)i1 * B1;
-            r[0] = ct[(B-1)*2];
-            for (int i2 = 0; i2 < B; i2++) r[1+i2] = ct[i2*2];
+            if (i8) {
+                int8_t *r = e8 + (size_t)i1 * B1;
+                r[0] = quant1((float)ct[(B-1)*2] / c->cmax, aj);
+                for (int i2 = 0; i2 < B; i2++) r[1+i2] = quant1((float)ct[i2*2] / c->cmax, aj);
+            }
+            else {
+                f16_t *r = e + (size_t)i1 * B1;
+                r[0] = ct[(B-1)*2];
+                for (int i2 = 0; i2 < B; i2++) r[1+i2] = ct[i2*2];
+            }
         }
-        const rknn_tensor_attr &aj = m->ia[2+j];
-        f16_t *p = (f16_t *)m->in[2+j]->virt_addr;
-        int nb = aj.dims[0], C2 = aj.dims[4];
+        uint8_t *p = (uint8_t *)m->in[2+j]->virt_addr;
+        int nb = aj.dims[0], C2 = aj.n_dims == 4 ? aj.dims[3] : aj.dims[4];
         for (int k = 0; k < c->Kc; k++) {
             int n = nb > 1 ? k : 0, x0 = nb > 1 ? 0 : k * A;
             for (int k1 = 0; k1 < A; k1++) {
-                const f16_t *r = k1 >= k ? e + (size_t)(k1 - k) * B1 + 1 :
-                    e + (size_t)(A + k1 - k) * B1;
+                size_t r0 = k1 >= k ? (size_t)(k1 - k) * B1 + 1 :
+                    (size_t)(A + k1 - k) * B1;
+                const uint8_t *r = (i8 ? (const uint8_t *)e8 : (const uint8_t *)e) + r0 * es;
                 int k2 = 0;
-                if (C2 == 8) {
-                    for ( ; k2 + 8 <= B; k2 += 8) {
-                        memcpy(p + nat_off(aj, n, k2, x0 + k1), r + k2, 16);
-                    }
+                for ( ; k2 + C2 <= B; k2 += C2) { // C2 channels contiguous
+                    memcpy(p + nat_off(aj, n, k2, x0 + k1) * es, r + k2 * es, C2 * es);
                 }
-                for ( ; k2 < B; k2++) p[nat_off(aj, n, k2, x0 + k1)] = r[k2];
+                for ( ; k2 < B; k2++) {
+                    memcpy(p + nat_off(aj, n, k2, x0 + k1) * es, r + k2 * es, es);
+                }
             }
         }
     }
@@ -977,7 +992,7 @@ static int run_chunk_model(worker_t *w, const call_t *c, rmodel_t *m)
     else step_carr_nat(w, c, m, m->kind >= RM_FOLD ? 1 : c->Kc);
     t1 = cputime(); w->t[0] += t1 - t0; t0 = t1;
     if (m->code_gen != c->code_gen) {
-        if (m->kind == RM_SHIFT) step_code_shift(w, c, m);
+        if (m->kind == RM_SHIFT || m->kind == RM_SHIFTQ) step_code_shift(w, c, m);
         else step_code_nat(c, m);
     }
     t1 = cputime(); w->t[4] += t1 - t0; t0 = t1;
@@ -985,7 +1000,7 @@ static int run_chunk_model(worker_t *w, const call_t *c, rmodel_t *m)
     t1 = cputime(); w->t[1] += t1 - t0; t0 = t1;
     // model output: power / 64 (INT8 model: code normalized by max magnitude)
     float sc = c->scale * 64.0f;
-    if (m->kind == RM_FOLDQ) sc *= c->cmax * c->cmax;
+    if (m->kind == RM_FOLDQ || m->kind == RM_SHIFTQ) sc *= c->cmax * c->cmax;
     step_out_nat(w, c, m, sc);
     t1 = cputime(); w->t[8] += t1 - t0;
     return 1;
@@ -995,7 +1010,10 @@ static int run_chunk_model(worker_t *w, const call_t *c, rmodel_t *m)
 static int run_chunk(worker_t *w, const call_t *c)
 {
     rmodel_t *rm = NULL;
-    if (int8_model && fold_model && c->S == 1) {
+    if (int8_model && shift_model && fold_model && c->S == 1) {
+        rm = get_rmodel(w, c->M, c->Kc, c->R, RM_SHIFTQ);
+    }
+    if (!rm && int8_model && fold_model && c->S == 1) {
         rm = get_rmodel(w, c->M, c->Kc, c->R, RM_FOLDQ);
     }
     if (!rm && shift_model && fold_model && c->S == 1) {

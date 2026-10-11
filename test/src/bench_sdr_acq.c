@@ -3,6 +3,7 @@
 //
 //  usage: bench_sdr_acq [-fmt RAW32|RAW16|INT8X2] [-f fs_MHz] [-fo f1,f2,...]
 //             [-toff s] [-n nrep] [-acc backend] [-wisdom file] [-o out_file]
+//             [-dec ch:D[:foff_MHz],...] (decimated sub-bands as pocket_trk -dec)
 //             -sig sig -prn prns -rfch ch [-sig ...] file
 //
 //  -wisdom file: FFTW wisdom file (FFTW build). If the file does not exist,
@@ -133,15 +134,24 @@ static void search(const char *sig, int prn, const sdr_buff_t *buff, double fs,
     res->prn = prn;
     if (!ch) return;
 
-    // correlation power map of first T_ACQ by sdr_search_code() (same as search_sig())
+    // correlation power map of first T_ACQ by sdr_search_code() or multi-window
+    // search of the accelerator backend (same as search_sig())
     extern double sdr_t_acq;
     int M = 2 * ch->N, n = ch->acq->len_fds, ncall = 0;
     float *P = (float *)sdr_malloc(sizeof(float) * M * n);
     double t0 = wall_time(), c0 = cpu_time(), b0 = npu_busy(), e0 = pkg_energy();
-    for (int ix = 0; ncall * ch->T < sdr_t_acq && ix + M <= buff->N; ix += ch->N) {
-        sdr_search_code2(ch->acq->code_fft, ch->T, buff, ix, M, ch->N, fs,
-            ch->fi, ch->acq->fds, n, P);
+    int ixs[256], nw = 0;
+    for (int ix = 0; ncall * ch->T < sdr_t_acq && ix + M <= buff->N && nw < 256; ix += ch->N) {
+        ixs[nw++] = ix;
         ncall++;
+    }
+    memset(P, 0, sizeof(float) * M * n);
+    if (!sdr_acc_search_multi() || !sdr_acc_search_code_multi(ch->acq->code_fft,
+        ch->T, buff, ixs, nw, M, ch->N, fs, ch->fi, ch->acq->fds, n, P)) {
+        for (int i = 0; i < nw; i++) { // per window (as search_sig())
+            sdr_search_code2(ch->acq->code_fft, ch->T, buff, ixs[i], M, ch->N,
+                fs, ch->fi, ch->acq->fds, n, P);
+        }
     }
     res->t_wall = wall_time() - t0;
     res->t_cpu = cpu_time() - c0;
@@ -203,6 +213,8 @@ int main(int argc, char **argv)
     int nsig = 0, fmt = SDR_FMT_RAW32, nrep = 1;
     double fs = 16e6, fo[SDR_MAX_RFCH] = {0}, toff = 1.0;
     const char *file = "", *out = "", *acc = "cpu", *wisdom = "";
+    int ndec = 0, dec_ch[8], dec_D[8];
+    double dec_foff[8];
 
     for (int i = 1; i < argc; i++) {
         if (!strcmp(argv[i], "-fmt") && i + 1 < argc) {
@@ -225,6 +237,18 @@ int main(int argc, char **argv)
             wisdom = argv[++i];
         } else if (!strcmp(argv[i], "-o") && i + 1 < argc) {
             out = argv[++i];
+        } else if (!strcmp(argv[i], "-dec") && i + 1 < argc) {
+            for (char *p = argv[++i]; ndec < 8; p++) {
+                int ch, D, k = 0;
+                double foff = 0.0;
+                if (sscanf(p, "%d:%d%n", &ch, &D, &k) < 2) break;
+                p += k;
+                if (*p == ':' && sscanf(p + 1, "%lf%n", &foff, &k) >= 1) p += 1 + k;
+                dec_ch[ndec] = ch - 1;
+                dec_D[ndec] = D;
+                dec_foff[ndec++] = foff * 1e6;
+                if (*p != ',') break;
+            }
         } else if (!strcmp(argv[i], "-sig") && i + 1 < argc && nsig < MAX_SIG) {
             strcpy(sigs[nsig].sig, argv[++i]);
             sigs[nsig].nprn = 0;
@@ -251,7 +275,21 @@ int main(int argc, char **argv)
     for (int i = 0; i < nsig; i++) {
         sdr_buff_t *buff = read_if(file, fmt, fs, sigs[i].rfch, toff, T_DATA);
         if (!buff) return -1;
-        double fi = sdr_sig_freq(sigs[i].sig) - fo[sigs[i].rfch];
+        double fi = sdr_sig_freq(sigs[i].sig) - fo[sigs[i].rfch], fsd = fs;
+        for (int j = 0; j < ndec; j++) { // decimated sub-band including the signal
+            double fo_d = fs / dec_D[j];
+            if (dec_ch[j] != sigs[i].rfch || fabs(fi - dec_foff[j]) > fo_d / 2) continue;
+            sdr_dec_t *dec = sdr_dec_new(dec_D[j], 0, 0.0, dec_foff[j], fs);
+            sdr_buff_t *bd = dec ? sdr_buff_new(buff->N / dec_D[j], 2) : NULL;
+            if (!bd) return -1;
+            sdr_dec_apply(dec, buff->data, buff->N / dec_D[j] * dec_D[j], bd->data);
+            sdr_dec_free(dec);
+            sdr_buff_free(buff);
+            buff = bd;
+            fsd = fo_d;
+            fi -= floor(fi / fsd + 0.5) * fsd; // aliased to [-fsd/2, fsd/2)
+            break;
+        }
         double tw = 0.0, tc = 0.0, tn = 0.0, te = 0.0;
         int nfound = 0;
         sdr_acc_stat(NULL, 1);
@@ -259,7 +297,7 @@ int main(int argc, char **argv)
         for (int j = 0; j < sigs[i].nprn; j++) {
             acq_res_t res;
             for (int k = 0; k < nrep; k++) {
-                search(sigs[i].sig, sigs[i].prns[j], buff, fs, fi, &res);
+                search(sigs[i].sig, sigs[i].prns[j], buff, fsd, fi, &res);
                 tw += res.t_wall;
                 tc += res.t_cpu;
                 tn += res.t_npu;
