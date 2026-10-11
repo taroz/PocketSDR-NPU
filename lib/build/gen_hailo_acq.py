@@ -3,7 +3,7 @@
 #  generate Hailo HEF models of parallel code search for Hailo NPU plugin
 #  (libsdr_acc_hailo.so)
 #
-#  usage: gen_hailo_acq.py [-o dir] [-fs fs] [-n] M:Kc:R ...
+#  usage: gen_hailo_acq.py [-o dir] [-fs fs] [-sig sig,...] [-n] M:Kc:R ...
 #
 #    M  : DFT size (2 x samples per code period)
 #    Kc : Doppler bins per inference (spaced by fs / M)
@@ -12,6 +12,8 @@
 #         48000:7:112 for 24 MHz, 16000:7:64 for 8 MHz)
 #    -o : output directory (default: ../linux/hailo)
 #    -fs: sampling frequency (MHz) of the calibration signals (default: 24)
+#    -sig: codes of the calibration signals, the first two also evaluated
+#         (default: L1CA,L5I,B1I,E5AI, e.g. E1B,E1C for 64000 at 8 MHz)
 #    -n : no compile (ONNX, quantization and emulator evaluation only)
 #
 #  The model (inputs xr, xi [1][n1][1][n2], IF samples wiped by the carrier of
@@ -32,6 +34,7 @@
 #
 #  History:
 #  2026-10-11  1.0  new
+#  2026-10-11  1.1  add option -sig
 #
 import sys, os
 import numpy as np
@@ -41,7 +44,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), '../../python'))
 from gen_rknn_acq import factorize
 
-SIGS = ('L1CA', 'L5I', 'B1I', 'E5AI') # codes of calibration signals
+SIGS = ['L1CA', 'L5I', 'B1I', 'E5AI'] # codes of calibration signals
 
 # build ONNX model --------------------------------------------------------------
 def build(A, B, Kc, R):
@@ -140,7 +143,7 @@ def gen_hef(onnx_file, name, A, B, Kc, R, fs, out_dir, nocomp):
     cal = [[] for _ in range(4)]
     for i in range(64):
         d, _, _ = sig_input(rng, A, B, Kc, fs, rng.uniform(30, 58) if i % 4 else 0,
-            SIGS[(i // 4) % 4])
+            SIGS[(i // 4) % len(SIGS)])
         for j in range(4): cal[j].append(nhwc(d[j])[0])
     r.load_model_script('model_optimization_flavor(optimization_level=0, compression_level=0)\n'
         'quantization_param([%s], precision_mode=a16_w16)\n' % ', '.join(tail))
@@ -148,7 +151,7 @@ def gen_hef(onnx_file, name, A, B, Kc, R, fs, out_dir, nocomp):
     print('sig  C/N0  peak_pos  dCN0(q-ref) mean/std  NRMSE  peak(q/ref)')
     M, N = A * B, A * B // 2
     with r.infer_context(InferenceContext.SDK_QUANTIZED) as ctx:
-        for sig in ('L1CA', 'L5I'):
+        for sig in SIGS[:2]:
             for cn0 in (36, 40, 45, 50, 55):
                 pk, dc, er, pr = 0, [], [], []
                 for _ in range(5):
@@ -176,6 +179,7 @@ if __name__ == '__main__':
     while i < len(sys.argv):
         if sys.argv[i] == '-o': out_dir = sys.argv[i + 1]; i += 1
         elif sys.argv[i] == '-fs': fs = float(sys.argv[i + 1]) * 1e6; i += 1
+        elif sys.argv[i] == '-sig': SIGS[:] = sys.argv[i + 1].split(','); i += 1
         elif sys.argv[i] == '-n': nocomp = True
         else: shapes.append([int(v) for v in sys.argv[i].split(':')])
         i += 1

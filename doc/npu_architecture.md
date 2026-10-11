@@ -1576,3 +1576,33 @@ HEFs by `lib/build/gen_hailo_acq.py` (Dataflow Compiler 5.4.0, x86) in
   (the same signals found later by `cpu_opt`). The losses of weak signals
   (L5I 34-37 dB-Hz, L1CA 30 dB-Hz) are the same with `cpu_opt` (6 signals:
   `cpu_opt` 10 found / 5 lost, Hailo 12 / 6). CPU load ~50% of 4 cores.
+- E1B/E1C (4 ms, 8 MHz by the decimation, M = 64000, calibration and
+  evaluation by `-sig E1B,E1C`): Kc = 7 could not be allocated with any
+  factorization (250x256, 256x250, 200x320, 320x200: transpose of the format
+  conversion, 2 APUs); Kc = 3 / R = 128 outputs wrong powers with batch > 1
+  (NRMSE 0.7-0.97, correct without batch, 456 ms per search); Kc = 1 / R =
+  125 correct but 610 ms per search. Kc = 5 / R = 128 (the plugin searches Kc
+  = 7, 5, 3, 1) is correct with batch 16 for all code offsets and bins
+  (BOC(1,1) test signals, 128/128): 183 ms per search (81 bins x 5 windows)
+  vs 274 ms of `cpu_opt` on an A76 core. E1B/E1C only (72 channels, 60 s):
+  the same 16 signals found, 242 vs 186 searches.
+- All-in-view capacity (Pi 5, 300 s, signal sets of 14.5, decimation
+  `-dec 1:3:7.42,1:3:-6.902,2:3`, FFTW build with wisdom, no `-rcv_prio`
+  (no `setcap`), the lag of the receiver time behind the wall time at 300 s):
+
+| N | configuration | lag at 300 s | max BUFF | LOCK (end) | CPU |
+|---|---|---|---|---|---|
+| 100 | `cpu_opt` | 5 s | 11% | 94 / 242 | 84% |
+| 100 | Hailo (no E1B model) | 5 s | 12% | 90 / 242 | 83% |
+| 100 | Hailo (with E1B model) | **0 s** | 4% | 96 / 242 | 83% |
+| 160 | `cpu_opt` | 26 s | 23% | 148 / 302 | 94% |
+| 160 | Hailo (no E1B model) | 21 s | 19% | 149 / 302 | 94% |
+| 160 | Hailo (with E1B model) | 16 s | 9% | 152 / 302 | 96% |
+| 200 | `cpu_opt` | 45 s | 20% | 184 / 342 | 95% |
+| 200 | Hailo (no E1B model) | 53 s | 18% | 186 / 342 | 95% |
+
+- With the E1B model the searches falling back to the CPU drop from 1257 to
+  217 (N=100), and the receiver keeps the real time at N=100. The real-time
+  limit of the Pi 5 is ~100-130 channels with or without the NPU: the
+  tracking correlators saturate the 4 A76 cores, as on the RK3588 (13.14),
+  and the all-in-view set (~190-200 signals) is not possible in real time.

@@ -25,6 +25,9 @@
 //    +B-6 samples in groups of 8 columns. R is padded to avoid it (Kc = 7,
 //    R = 112 for M = 48000 and R = 64 for M = 16000 verified). A HEF has to
 //    be verified on the device by the peak positions of all code offsets.
+//  - M = 64000 (E1B/E1C at 8 MHz): Kc = 7 could not be allocated (transpose
+//    of the format conversion), Kc = 3 outputs wrong powers with batch > 1,
+//    Kc = 5 / R = 128 verified with batch 16.
 //  - The calibration set has to include the codes of 10.23 Mcps (flat code
 //    spectrum normalized by the max magnitude), otherwise the peaks of strong
 //    signals are clipped and the Doppler bin of the max power is wrong.
@@ -45,6 +48,7 @@
 //
 //  History:
 //  2026-10-11  1.0  new
+//  2026-10-11  1.1  add model of Kc = 5
 //
 #include <stdio.h>
 #include <stdlib.h>
@@ -228,14 +232,14 @@ static int search_multi(const float **xs, const int8_t **x8s, int NW,
     for (int k = 1; k < K; k++) {
         if (fabs((fc[k] - fc[0]) * M / fs - k) > 1e-3) return 0;
     }
-    // model with the largest Kc (7, 3, 1) and the smallest R >= nout / B
+    // model with the largest Kc (7, 5, 3, 1) and the smallest R >= nout / B
     // (R < nout / B + 16, R padded for the output features to avoid the
     // corrupted outputs of some multi-context HEFs) (a frame of Kc = 7 takes
     // about the same time as that of Kc = 1, the bins >= K are not used)
     int R = (nout + B - 1) / B;
     hmodel_t *m = NULL;
-    static const int kcs[] = {7, 3, 1};
-    for (int i = 0; i < 3 && !m; i++) {
+    static const int kcs[] = {7, 5, 3, 1};
+    for (int i = 0; i < 4 && !m; i++) {
         for (int r = R; r < R + 16 && !m; r++) {
             m = get_model(M, kcs[i], r);
         }
