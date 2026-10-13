@@ -1858,4 +1858,67 @@ Hailo runs track more signals at 24 MHz), so the larger number of the Hailo
 runs is not by lighter signals: the maximum tracking load in real time is
 ~2.63 cores with Hailo vs ~2.48-2.53 with `cpu_opt` (+4-6%), ~149 vs ~142
 signals. (A comparison by the same set of tracked signals is planned for
-the paper.)
+the paper, see 14.13.)
+
+### 14.13 Fixed-set capacity of the Pi 5 (Hailo vs `cpu_opt`)
+
+To compare the backends by the same signals, the channels 1..N of every run
+are a fixed set of signals, the same for both backends:
+
+- the set: 157 signals tracked without gaps of the channel log from the first
+  lock to >= 295 s in both 24 MHz reference runs of the ROCK 5B
+  (`u24_260_optdec`, `ug24_260_optdec`), taken in a stratified order by
+  signal so that the sets are nested (S_140 in S_157 in S_175 ...); N > 157
+  duplicates the signals in the same order (a duplicate channel costs the
+  same as the original one).
+- + 142 background search channels (signals never found, the same as 14.10),
+  so that the search load is also the same.
+- signals at 24 MHz (L5/E5a/B2a, E5b/B2b bands, ~28 ms/s per channel) in the
+  fixed set: 53 (N = 140), 59 (157), 66 (175), 76 (200).
+- settings of 14.12: HEFs of plugin 1.3, `-trk_guard 20`, `-rcv_prio 10`,
+  decimation, 300 s, CPU governor performance, 2 runs per N and backend
+  alternated (Hailo, `cpu_opt`, Hailo, ...). Scripts `gen_fix.py`,
+  `pi_fix.sh`, `fx_sum.py`, `fx_sum2.py` (in `~/trk_long` of the Pi).
+
+Results (two runs, "a / b"; locks: number of the fixed channels locked by
+10/30/60/300 s, mean of the two runs; t95: time when 95% of the fixed set
+is locked; losses: gaps > 2 s of the channel log of the fixed channels):
+
+| N | backend | TRK max | TRK > 100% | locks 10/30/60/300 s | t90 / t95 (s) | losses |
+|---|---|---|---|---|---|---|
+| 140 | Hailo | 3% / 4% | 0 / 0 s | 61 / **133** / 134 / 138 | 27 / 30 | 13 / 17 |
+| 140 | `cpu_opt` | 8% / 15% | 0 / 0 s | 52 / **101** / 135 / 137 | 46 / 53 | 10 / 20 |
+| 157 | Hailo | 30% / 32% | 0 / 0 s | 63 / **139** / 152 / 155 | 31 / 35 | 238\* / 19 |
+| 157 | `cpu_opt` | 42% / 33% | 0 / 0 s | 54 / **104** / 143 / 152 | 58 / 73-229 | 3 / 5 |
+| 175 | Hailo | 41% / 51% | **0 / 0 s** | 66 / **144** / **172** / 172 | 36 / 42 | 20 / 21 |
+| 175 | `cpu_opt` | 49% / **126%** | 0 / **3 s** | 56 / **108** / 149 / 171 | 73 / 96 | 21 / 352 |
+| 200 | Hailo | 106% / 106% | 7 / 6 s | 66 / 151 / 176 / 184 | 68-111 / - | 350 / 444 |
+| 200 | `cpu_opt` | 124% / 147% | 19 / 18 s | 59 / 109 / 156 / 179 | 126- / - | 191 / 352 |
+
+(CPU 96-103% per core in all runs, i.e. the 4 cores are saturated by the
+search when the tracking load is low.)
+
+- **Initial acquisition**: with the same signals, the NPU locks ~95% of the
+  fixed set by 30 s vs ~72% with `cpu_opt` (133 vs 101 at N = 140, 144 vs
+  108 at N = 175). The time to 95% of the set is 30-42 s with Hailo vs
+  53-98 s with `cpu_opt` (1.8-2.3x shorter, except 229 s of one run).
+- **Real-time limit**: Hailo runs N = 175 without overflow in both runs
+  (TRK max 41-51%); `cpu_opt` overflows at N = 175 in one of the two runs
+  (126%, 3 s, 352 losses). At N = 200 both overflow, Hailo for 6-7 s vs
+  `cpu_opt` 18-19 s. The limit is ~175 fixed signals with Hailo vs ~157-175
+  with `cpu_opt`, consistent with the load-weighted +4-6% of 14.12.
+- **Losses**: without overflow, the losses are 3-21 for both backends (a few
+  weak signals, e.g. channels 37, 41, 50 lost repeatedly). \*The run
+  Hailo N = 157 a has a lagging episode from ~195 s: the TRK buffer stays at
+  15-30% (no overflow), the status LOCK stays 154, but 64 channels have
+  short gaps of the log (mostly 3-10 s, 238 in total) — channels lagging
+  behind (as 14.12 N = 175), not real losses of lock. The other run of
+  N = 157 and both runs of N = 175 have no such episode, so the lagging is a
+  sporadic event near the limit, not a deterministic overload.
+- 2-5 signals of the fixed set are never locked in 300 s (the set was
+  selected by the 24 MHz runs of the ROCK 5B), so the "time to lock all" is
+  not defined; t90 / t95 are used instead.
+
+The NPU gives a margin of about +10% of the fixed set in real time
+(N = 175 vs 157) and a 2x faster initial acquisition with the same tracking
+work, although the Pi 5 CPU (4 x A76) stays the bottleneck of tracking.
