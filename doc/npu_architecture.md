@@ -1833,7 +1833,29 @@ governor performance, single runs; TRK max / seconds > 100% / LOCK at 30 s /
 | 175 | 90% / 0 s / 113 / 135 / **154** | 124% / 3 s (SRCH 125%) / 83 / 120 / 142 |
 | 200 | 103% / 9 s / 120 / 153 / 150 | |
 
-The maximum number of signals tracked in real time: ~154 with Hailo vs ~142
-with `cpu_opt` (+8%; 14.11 with plugin 1.1 / 1.2: ~134-140 vs ~129, the
-`cpu_opt` runs vary by run, 123-142 at N = 160); the NPU locks 30-45% more
-signals at 30 s (113-120 vs 83-84).
+The LOCK 154 of Hailo at N = 175 is not in real time: the buffer usage
+increases to 90% at the end, the channels lag (78 channels with gaps of the
+channel log of 5174 s in total, the status not updated), and only 130 signals
+are logged in 240-300 s. The NPU locks 30-45% more signals at 30 s (113-120
+vs 83-84).
+
+**Load-weighted comparison**: the tracking cost differs by signal (mainly by
+the sampling rate). The CPU time per channel-second was measured by
+`bench_sdr_trk` with `-dec` (one A76 core, 5 s, the signals and PRNs tracked
+in the runs): ~28 ms/s for the signals at 24 MHz (L5/E5a/B2a, E5b/B2b bands),
+9-12 ms/s at 8 MHz (L1/E1/B1, L2 decimated). The load of the signals tracked
+in 240-300 s:
+
+| run | signals (at 24 MHz) | load (cores) | mean (ms/s/ch) |
+|---|---|---|---|
+| N = 145 Hailo / `cpu_opt` | 142 (67) / 132 (61) | 2.57 / 2.36 | 18.1 / 17.9 |
+| N = 160 Hailo / `cpu_opt` | 149 (67) / 142 (62) | **2.63** / **2.48** | 17.7 / 17.5 |
+| N = 175 Hailo / `cpu_opt` | 130 (43) lagging / 142 (64), 3 s overflow | 2.03 / 2.53 | 15.6 / 17.8 |
+| N = 200 Hailo | 143 (62), 9 s overflow | 2.52 | 17.6 |
+
+The mix of the signals is about the same (17.5-18.1 ms/s per channel, the
+Hailo runs track more signals at 24 MHz), so the larger number of the Hailo
+runs is not by lighter signals: the maximum tracking load in real time is
+~2.63 cores with Hailo vs ~2.48-2.53 with `cpu_opt` (+4-6%), ~149 vs ~142
+signals. (A comparison by the same set of tracked signals is planned for
+the paper.)

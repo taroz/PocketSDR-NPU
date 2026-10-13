@@ -3,8 +3,8 @@
 //
 //  usage: bench_sdr_trk [-fmt RAW32|RAW16|INT8X2] [-f fs_MHz] [-fo f1,f2,...]
 //             [-toff s] [-tlen s] [-acc backend] [-tacc backend] [-batch]
-//             [-nposx n] [-sp_corr chip] [-o out_file] -sig sig -prn prns
-//             -rfch ch [-sig ...] file
+//             [-nposx n] [-sp_corr chip] [-dec ch:D[:foff_MHz],...]
+//             [-o out_file] -sig sig -prn prns -rfch ch [-sig ...] file
 //
 //  The signals are acquired by the receiver channel state machine
 //  (sdr_ch_update() in SDR_STATE_SRCH) and tracked over the same IF samples
@@ -15,7 +15,8 @@
 //  by the tracking backend -tacc, sdr_ch_update_post()). The tracking states
 //  and the correlator outputs of each epoch are written to out_file for the
 //  regression (cmp_trk.py). -sp_corr sets the E-L correlator spacing (chip)
-//  (receiver option sp_corr).
+//  (receiver option sp_corr). -dec decimates the sub-bands as pocket_trk -dec
+//  (a signal in a sub-band is tracked at fs / D).
 //
 #include <sys/resource.h>
 #include <time.h>
@@ -31,8 +32,9 @@ typedef struct {            // signal spec
 
 typedef struct {            // tracking channel
     sdr_ch_t *ch;           // receiver channel
-    int rfch;               // RF channel
+    int rfch;               // RF channel (band index with -dec)
     int ix0;                // start index of tracking (samples)
+    double fs;              // sampling frequency of the band (Hz)
 } trk_ch_t;
 
 // wall clock (s) --------------------------------------------------------------
@@ -129,7 +131,9 @@ int main(int argc, char **argv)
     static sdr_corr_job_t jobs[MAX_CH];
     static sdr_ch_t *jch[MAX_CH];
     sig_spec_t sigs[MAX_SIG];
-    sdr_buff_t *buffs[SDR_MAX_RFCH] = {0};
+    sdr_buff_t *buffs[SDR_MAX_RFCH * 9] = {0}; // RF channels, sub-bands
+    int ndec = 0, dec_ch[8], dec_D[8];
+    double dec_foff[8];
     int nsig = 0, fmt = SDR_FMT_RAW32, batch = 0, nposx = 0, nch = 0;
     double fs = 16e6, fo[SDR_MAX_RFCH] = {0}, toff = 1.0, tlen = 3.0;
     double tacq = 1.0;
@@ -163,6 +167,18 @@ int main(int argc, char **argv)
             sdr_sp_corr = atof(argv[++i]);
         } else if (!strcmp(argv[i], "-o") && i + 1 < argc) {
             out = argv[++i];
+        } else if (!strcmp(argv[i], "-dec") && i + 1 < argc) {
+            for (char *p = argv[++i]; ndec < 8; p++) {
+                int ch, D, k = 0;
+                double foff = 0.0;
+                if (sscanf(p, "%d:%d%n", &ch, &D, &k) < 2) break;
+                p += k;
+                if (*p == ':' && sscanf(p + 1, "%lf%n", &foff, &k) >= 1) p += 1 + k;
+                dec_ch[ndec] = ch - 1;
+                dec_D[ndec] = D;
+                dec_foff[ndec++] = foff * 1e6;
+                if (*p != ',') break;
+            }
         } else if (!strcmp(argv[i], "-sig") && i + 1 < argc && nsig < MAX_SIG) {
             strcpy(sigs[nsig].sig, argv[++i]);
             sigs[nsig].nprn = 0;
@@ -190,18 +206,35 @@ int main(int argc, char **argv)
             !(buffs[rfch] = read_if(file, fmt, fs, rfch, toff, tacq + tlen))) {
             return -1;
         }
-        double fi = sdr_sig_freq(sigs[i].sig) - fo[rfch];
+        double fi = sdr_sig_freq(sigs[i].sig) - fo[rfch], fsd = fs;
+        int band = rfch;
+        for (int j = 0; j < ndec; j++) { // decimated sub-band including the signal
+            double fo_d = fs / dec_D[j];
+            if (dec_ch[j] != rfch || fabs(fi - dec_foff[j]) > fo_d / 2) continue;
+            band = SDR_MAX_RFCH * (j + 1) + rfch;
+            if (!buffs[band]) {
+                sdr_dec_t *dec = sdr_dec_new(dec_D[j], 0, 0.0, dec_foff[j], fs);
+                int nd = buffs[rfch]->N / dec_D[j];
+                if (!dec || !(buffs[band] = sdr_buff_new(nd, 2))) return -1;
+                sdr_dec_apply(dec, buffs[rfch]->data, nd * dec_D[j], buffs[band]->data);
+                sdr_dec_free(dec);
+            }
+            fsd = fo_d;
+            fi -= floor(fi / fsd + 0.5) * fsd; // aliased to [-fsd/2, fsd/2)
+            break;
+        }
         for (int j = 0; j < sigs[i].nprn && nch < MAX_CH; j++) {
-            sdr_ch_t *ch = sdr_ch_new(sigs[i].sig, sigs[i].prns[j], fs, fi);
+            sdr_ch_t *ch = sdr_ch_new(sigs[i].sig, sigs[i].prns[j], fsd, fi);
             if (!ch) continue;
             if (nposx > 0) sdr_ch_set_corr(ch, nposx, 2.0 * ch->T / ch->len_code);
-            int ix0 = acquire(ch, buffs[rfch], tacq);
+            int ix0 = acquire(ch, buffs[band], tacq);
             if (ix0 < 0) {
                 sdr_ch_free(ch);
                 continue;
             }
             chs[nch].ch = ch;
-            chs[nch].rfch = rfch;
+            chs[nch].rfch = band;
+            chs[nch].fs = fsd;
             chs[nch++].ix0 = ix0;
         }
     }
@@ -226,7 +259,7 @@ int main(int argc, char **argv)
         const sdr_buff_t *buff = buffs[rfch];
         double t0 = wall_time(), c0 = cpu_time();
         for (int ix = ix_min; ix + 2 * N <= buff->N; ix += N) {
-            double time = (double)(ix + 2 * N) / fs;
+            double time = (double)(ix + 2 * N) / chs[i].fs;
             int njob = 0;
             for (int k = 0; k < ng; k++) {
                 trk_ch_t *c = chs + gch[k];
@@ -272,7 +305,7 @@ int main(int argc, char **argv)
             st.t_in, st.t_exec, st.t_out);
     }
     for (int i = 0; i < nch; i++) sdr_ch_free(chs[i].ch);
-    for (int i = 0; i < SDR_MAX_RFCH; i++) sdr_buff_free(buffs[i]);
+    for (int i = 0; i < SDR_MAX_RFCH * 9; i++) sdr_buff_free(buffs[i]);
     sdr_acc_trk_exit();
     sdr_acc_exit();
     return 0;
