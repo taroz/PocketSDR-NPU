@@ -1820,3 +1820,20 @@ offsets with both models.
 For the Hailo-8 (no device DRAM, inputs streamed to the on-chip memory), the
 NHWC conversion rate and the FCR rate (500-800 MB/s on the Hailo-10H) should
 be measured first by the same single Conv models.
+
+**Pi 5 capacity with plugin 1.3** (HEFs 320000:1:200:400, 64000:5:168:320,
+settings of 14.11: `-trk_guard 20`, `-rcv_prio 10`, decimation, 300 s, CPU
+governor performance, single runs; TRK max / seconds > 100% / LOCK at 30 s /
+60 s / end):
+
+| N | Hailo (plugin 1.3) | `cpu_opt` |
+|---|---|---|
+| 145 | 16% / 0 s / 114 / 117 / 137 | 26% / 0 s / 83 / 110 / 132 |
+| 160 | 101% / 1 s / 119 / 127 / 148 | 56% / 0 s / 84 / 117 / 142 |
+| 175 | 90% / 0 s / 113 / 135 / **154** | 124% / 3 s (SRCH 125%) / 83 / 120 / 142 |
+| 200 | 103% / 9 s / 120 / 153 / 150 | |
+
+The maximum number of signals tracked in real time: ~154 with Hailo vs ~142
+with `cpu_opt` (+8%; 14.11 with plugin 1.1 / 1.2: ~134-140 vs ~129, the
+`cpu_opt` runs vary by run, 123-142 at N = 160); the NPU locks 30-45% more
+signals at 30 s (113-120 vs 83-84).
