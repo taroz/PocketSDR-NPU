@@ -35,9 +35,12 @@
 //    inputs FCR, L2CM 20 ms direct search 2291 -> 1260 ms). The order is
 //    chosen by the compiler (not simply by the shape: 64000 by 200 x 320 or
 //    160 x 400 and 16000 by 80 x 200 still have NHWC inputs). The
-//    factorization with A, B multiples of 8 is tried first, then factorize()
-//    (A, B of the HEF by the input shape). Verified: 320000:1:200 (400 x
-//    800); 64000:5:100 (200 x 320) outputs displaced samples (not used).
+//    factorization with A, B multiples of 8 is tried first, then swapped (A >
+//    B), then factorize() (A, B of the HEF by the input shape). Verified:
+//    320000:1:200 (400 x 800), 64000:5:168 (320 x 200, all FCR, 816 -> 800
+//    fps vs 576 fps of 64000:5:128 by 250 x 256, E1B 191 -> 157 ms); the
+//    outputs of 64000:5:R by 200 x 320 (R = 100, 104, 108) and 320 x 200 (R =
+//    160, 164, 172) are displaced.
 //  - The calibration set has to include the codes of 10.23 Mcps (flat code
 //    spectrum normalized by the max magnitude), otherwise the peaks of strong
 //    signals are clipped and the Doppler bin of the max power is wrong.
@@ -66,7 +69,8 @@
 //  2026-10-12  1.2  code DFT rolled by chunk instead of the carrier wipe-off
 //                   of the IF samples per frame (shared DFT identity)
 //  2026-10-13  1.3  factorization of the HEF by the input shape, A, B
-//                   multiples of 8 tried first (native input order)
+//                   multiples of 8 (and swapped) tried first (native input
+//                   order)
 //
 #include <stdio.h>
 #include <stdlib.h>
@@ -262,10 +266,12 @@ static int search_multi(const float **xs, const int8_t **x8s, int NW,
     const float *code, int M, double fs, const double *fc, int K, int nout,
     float *P, int ldP, sdr_acc_prof_t *prof)
 {
-    int fa[2][2] = {{0}}, A, B;
+    int fa[3][2] = {{0}}, A, B;
     if (!vdev || K < 1 || NW < 1) return 0;
-    factorize8(M, &fa[0][0], &fa[0][1]);
-    factorize(M, &fa[1][0], &fa[1][1]);
+    if (factorize8(M, &fa[0][0], &fa[0][1])) {
+        fa[1][0] = fa[0][1]; fa[1][1] = fa[0][0]; // swapped (A > B)
+    }
+    factorize(M, &fa[2][0], &fa[2][1]);
     std::lock_guard<std::mutex> lock(call_mtx);
     double t0 = now();
 
@@ -273,14 +279,15 @@ static int search_multi(const float **xs, const int8_t **x8s, int NW,
     for (int k = 1; k < K; k++) {
         if (fabs((fc[k] - fc[0]) * M / fs - k) > 1e-3) return 0;
     }
-    // model of the factorization by multiples of 8, then that of factorize(),
+    // model of the factorization by multiples of 8, swapped, then that of
+    // factorize(),
     // with the largest Kc (7, 5, 3, 1) and the smallest R >= nout / B
     // (R < nout / B + 16, R padded for the output features to avoid the
     // corrupted outputs of some multi-context HEFs) (a frame of Kc = 7 takes
     // about the same time as that of Kc = 1, the bins >= K are not used)
     hmodel_t *m = NULL;
     static const int kcs[] = {7, 5, 3, 1};
-    for (int j = 0; j < 2 && !m; j++) {
+    for (int j = 0; j < 3 && !m; j++) {
         if (!fa[j][0]) continue;
         int R = (nout + fa[j][1] - 1) / fa[j][1];
         for (int i = 0; i < 4 && !m; i++) {

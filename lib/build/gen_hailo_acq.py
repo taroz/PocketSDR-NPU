@@ -9,7 +9,7 @@
 #    Kc : Doppler bins per inference (spaced by fs / M)
 #    R  : output rows of IDFT (nout = R * B <= M / 2, A x B = M), padded to
 #         avoid the corrupted outputs of some multi-context HEFs (verified:
-#         48000:7:112 for 24 MHz, 16000:7:64, 64000:5:128, 160000:1:200,
+#         48000:7:112 for 24 MHz, 16000:7:64, 64000:5:168:320, 160000:1:200,
 #         320000:1:200:400 for 8 MHz)
 #    A  : factorization M = A x B (default: factorize(M)), A, B multiples of 8
 #         for the inputs in the native order of the device (e.g. 320000:1:200:400,

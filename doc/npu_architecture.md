@@ -1794,6 +1794,29 @@ ms vs 2291 ms** (plugin 1.2 with 320000:1:250, CPU 875 / 819 ms) vs 3026 ms of
 `cpu_opt` (2.4x). The other signals are unchanged (L1CA 136 ms, E1B 234 ms,
 L1CP 742 ms, CPU governor ondemand).
 
+**E1B / E1C model (M = 64000, Kc = 5)**: sweep of the factorization and R
+(fps of batch 16, orders of the inputs x / code, outputs verified on the
+device by the peak bins and code phases of 133-251 code offsets x 21 bins):
+
+| A x B | R | inputs x / code | fps | outputs |
+|---|---|---|---|---|
+| 250 x 256 (current) | 128 | FCR / NHWC | 576 | correct |
+| 200 x 320 | 100 / 104 / 108 | NHWC / FCR | 724 / 706 / 718 | displaced (~50%) |
+| 200 x 320 | 112 | NHWC / FCR | 695 | correct (329 offsets) |
+| 200 x 320 | 120 / 128 | mixed | 690 | - |
+| 128 x 500 | 64 | NHWC / NHWC | 408 | - |
+| 500 x 128 | 250 | FCR / FCR | 658 | - |
+| **320 x 200** | 160 / 164 / **168** / 172 / 176 / 192 | FCR / FCR | 816 / 816 / **813** / 804 / 800 / 787 | displaced / all / **correct (580 offsets)** / displaced / - / - |
+
+The displaced outputs are the device bug of 14.9 (+2, +B-6 samples, the
+neighbor bin), not seen in the emulator, and depend on R irregularly.
+64000:5:168:320 is used (plugin 1.3 tries the swapped factorization A > B
+after A, B multiples of 8): on the real data (E1B 17 PRNs, E1C 5 PRNs) **E1B
+191 -> 157 ms, E1C 173 -> 141 ms** per search (NPU 156 -> 119 ms per call, CPU
+82 -> 97 ms), the same detections, code phases and C/N0 (one neighbor bin).
+The mid-bin Doppler gives the neighbor bin of the reference for 11 of 251
+offsets with both models.
+
 For the Hailo-8 (no device DRAM, inputs streamed to the on-chip memory), the
 NHWC conversion rate and the FCR rate (500-800 MB/s on the Hailo-10H) should
 be measured first by the same single Conv models.
