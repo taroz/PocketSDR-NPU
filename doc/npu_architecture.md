@@ -1922,3 +1922,36 @@ search when the tracking load is low.)
 The NPU gives a margin of about +10% of the fixed set in real time
 (N = 175 vs 157) and a 2x faster initial acquisition with the same tracking
 work, although the Pi 5 CPU (4 x A76) stays the bottleneck of tracking.
+
+### 14.14 Hailo plugin 1.4: output accumulation overlapped with the inference
+
+- **Input order of the other HEFs**: all HEFs in use have FCR inputs except
+  M = 16000 (L1CA/B1I at 8 MHz, 128 x 125). The factorizations 200 x 80 (all
+  FCR) and 40 x 400 give 1241 and 1203 fps vs 1183 fps (the single context
+  Kc = 1 model 1302 fps): small models are limited by the overhead of a frame
+  (~0.8 ms), not by the transfer. 200 x 80 with R = 100 outputs displaced
+  samples (+2, 576 of 1143 code offsets) and is not used. A larger Kc to
+  amortize the overhead was not allocated by the compiler (Kc = 15: > 40 min,
+  Kc = 11: > 47 min, Kc = 21: not finished in 3 days).
+- **Output accumulation**: the outputs of a chunk (Kc bins x NW windows) are
+  accumulated as soon as its frames are done (completion callbacks or
+  `wait()`), overlapped with the inference of the next chunks. The tiles of
+  32 rows are transposed into a buffer and added to the rows of P (the
+  strided access of 1.3 was slower for cold outputs), the bins of a chunk by
+  3 threads. The results (hashes of the power maps) are identical to 1.3.
+- **Model selection**: the model of the fewest chunks of K bins (then the
+  smallest Kc of 1, 3, 5, 7, 11, 15, 21).
+
+Search time per signal on the Pi 5 (`bench_sdr_acq`, real data, all cores,
+mean of 2 runs alternated, plugin 1.3 -> 1.4):
+
+| signal | search (ms) | CPU (ms) |
+|---|---|---|
+| L1CA 24 MHz (M = 48000) | 136 -> 131 | 67 -> 69 |
+| L5I 24 MHz | 107 -> 101 | 66 -> 68 |
+| L1CA 8 MHz (M = 16000) | 76 -> 74 | 26 -> 29 |
+| E1B | 193 -> 178 | 98 -> 92 |
+| L2CM | 1440 -> 1330 | 908 -> 789 |
+
+(one core, `taskset -c 3`: L1CP 787 -> 702 ms, L2CM 1443 -> 1253 ms, E1B
+223 -> 182 ms.)

@@ -45,6 +45,10 @@
 //    spectrum normalized by the max magnitude), otherwise the peaks of strong
 //    signals are clipped and the Doppler bin of the max power is wrong.
 //
+//  - M = 16000: about 1200-1300 fps for any order or Kc = 1 (overhead of a
+//    frame about 0.8 ms), 200 x 80 (all FCR) 1241 fps but displaced outputs
+//    (R = 100); Kc = 11, 15, 21 not allocated in 40 min - 3 days.
+//
 //  All windows of an acquisition are searched in one call by
 //  search_code_i8_multi() (the frames of the windows and chunks queued at
 //  once), which is much faster with the batch size 8-16 than the call per
@@ -71,6 +75,9 @@
 //  2026-10-13  1.3  factorization of the HEF by the input shape, A, B
 //                   multiples of 8 (and swapped) tried first (native input
 //                   order)
+//  2026-10-13  1.4  outputs accumulated by chunk overlapped with the
+//                   inference (transposed by tiles, bins by threads), model
+//                   of the fewest chunks (Kc up to 21)
 //
 #include <stdio.h>
 #include <stdlib.h>
@@ -86,6 +93,7 @@
 #include <chrono>
 #include <algorithm>
 #include <thread>
+#include <atomic>
 #include <hailo/hailort.hpp>
 #include "sdr_acc.h"
 
@@ -107,6 +115,9 @@ struct hmodel_t {
     std::vector<uint8_t> cr, ci;               // code DFT [k1][k2]
     std::vector<std::vector<uint8_t>> crs, cis; // rolled code DFT (ring)
     std::vector<std::vector<uint16_t>> out;    // output per frame
+    std::vector<std::unique_ptr<std::atomic<uint32_t>[]>> done; // done flags
+    int ndone = 0;                             // (never freed for late callbacks)
+    uint32_t gen = 0;                          // generation of the call
 };
 static int batch_size = 0;              // batch size (0: HailoRT default)
 
@@ -232,19 +243,24 @@ static void carr_table(double f, int M, int B, float *tab)
 }
 
 // quantize IF samples of a window wiped by a carrier table (NHWC [n2][n1]) ----
+//   (transposed by tiles of TILE rows n1 for the cache)
+#define TILE 16     // tile rows of the input transpose
+#define ATILE 32    // tile rows of the output transpose
 template <typename T>
 static void prep_frame_t(int A, int B, const T *__restrict x,
     const float *__restrict tab, float sr, float si, float zr, float zi,
     uint8_t *__restrict xr, uint8_t *__restrict xi)
 {
-    for (int n1 = 0; n1 < A; n1++) {
-        const float *t = tab + 2 * B * n1;
-        const T *xp = x + 2 * B * n1;
+    for (int n1b = 0; n1b < A; n1b += TILE) {
+        int n1e = std::min(A, n1b + TILE);
         for (int n2 = 0; n2 < B; n2++) {
-            float re = xp[2*n2], im = xp[2*n2+1], cr = t[2*n2], ci = t[2*n2+1];
-            float q1 = (re * cr - im * ci) * sr + zr, q2 = (re * ci + im * cr) * si + zi;
-            xr[n2 * A + n1] = (uint8_t)(q1 < 0.f ? 0.f : (q1 > 255.f ? 255.f : q1));
-            xi[n2 * A + n1] = (uint8_t)(q2 < 0.f ? 0.f : (q2 > 255.f ? 255.f : q2));
+            for (int n1 = n1b; n1 < n1e; n1++) {
+                int n = B * n1 + n2;
+                float re = x[2*n], im = x[2*n+1], cr = tab[2*n], ci = tab[2*n+1];
+                float q1 = (re * cr - im * ci) * sr + zr, q2 = (re * ci + im * cr) * si + zi;
+                xr[n2 * A + n1] = (uint8_t)(q1 < 0.f ? 0.f : (q1 > 255.f ? 255.f : q1));
+                xi[n2 * A + n1] = (uint8_t)(q2 < 0.f ? 0.f : (q2 > 255.f ? 255.f : q2));
+            }
         }
     }
 }
@@ -280,21 +296,24 @@ static int search_multi(const float **xs, const int8_t **x8s, int NW,
         if (fabs((fc[k] - fc[0]) * M / fs - k) > 1e-3) return 0;
     }
     // model of the factorization by multiples of 8, swapped, then that of
-    // factorize(),
-    // with the largest Kc (7, 5, 3, 1) and the smallest R >= nout / B
-    // (R < nout / B + 16, R padded for the output features to avoid the
-    // corrupted outputs of some multi-context HEFs) (a frame of Kc = 7 takes
-    // about the same time as that of Kc = 1, the bins >= K are not used)
+    // factorize(), with the fewest chunks of K bins (then the smallest Kc of
+    // 1, 3, 5, 7, 11, 15, 21) and the smallest R >= nout / B (R < nout / B +
+    // 16, R padded for the output features to avoid the corrupted outputs of
+    // some multi-context HEFs) (a frame takes about 0.8 ms or more by the
+    // overhead of the device, nearly independent of Kc for small M, the bins
+    // >= K are not used)
     hmodel_t *m = NULL;
-    static const int kcs[] = {7, 5, 3, 1};
+    static const int kcs[] = {1, 3, 5, 7, 11, 15, 21};
     for (int j = 0; j < 3 && !m; j++) {
         if (!fa[j][0]) continue;
         int R = (nout + fa[j][1] - 1) / fa[j][1];
-        for (int i = 0; i < 4 && !m; i++) {
-            for (int r = R; r < R + 16 && !m; r++) {
-                m = get_model(M, kcs[i], r);
-                if (m && (m->A != fa[j][0] || m->B != fa[j][1])) m = NULL;
+        for (int i = 0; i < 7; i++) { // fewest chunks, then smallest Kc
+            hmodel_t *mi = NULL;
+            for (int r = R; r < R + 16 && !mi; r++) {
+                mi = get_model(M, kcs[i], r);
+                if (mi && (mi->A != fa[j][0] || mi->B != fa[j][1])) mi = NULL;
             }
+            if (mi && (!m || (K + kcs[i] - 1) / kcs[i] < (K + m->Kc - 1) / m->Kc)) m = mi;
         }
     }
     if (!m) return 0;
@@ -355,6 +374,62 @@ static int search_multi(const float **xs, const int8_t **x8s, int NW,
     }
     for (auto &t : th) t.join();
     double tB = now(), t1 = tB, tp = 0.0;
+    // P[k][B*p1+p2] += out[p2][k*R+p1] * 64 / M^2 * sx^2 * cmax^2 by chunk
+    // (as the jobs of the frames of the chunk are done, overlapped with the
+    // inference of the next chunks, the windows added to a row of P in the
+    // cache, tiles of ATILE rows p1 transposed into a buffer, bins by threads)
+    int Rm = m->R, W = Kc * Rm;
+    std::vector<float> tbs((size_t)NTHREAD * ATILE * B);
+    auto acc_bin = [&](int k, float *t) {
+        int c = k / Kc, kk = k % Kc;
+        float ozp = m->oz, *p = P + (size_t)k * ldP;
+        for (int w = 0; w < NW; w++) {
+            const uint16_t *ok = m->out[c * NW + w].data() + kk * Rm;
+            float osc = (float)(64.0 / ((double)M * M) * sx[w] * sx[w] * cmax * cmax * m->os);
+            for (int p1b = 0; p1b < Rm && B * p1b < nout; p1b += ATILE) {
+                int nt = std::min(Rm, p1b + ATILE) - p1b;
+                for (int p2 = 0; p2 < B; p2++) {
+                    const uint16_t *q = ok + (size_t)p2 * W + p1b;
+                    for (int i = 0; i < nt; i++) t[i * B + p2] = (float)q[i] - ozp;
+                }
+                for (int i = 0; i < nt; i++) {
+                    int n0 = B * (p1b + i), ne = std::min(B, nout - n0);
+                    float *__restrict pp = p + n0;
+                    const float *__restrict ti = t + (size_t)i * B;
+                    for (int j = 0; j < ne; j++) pp[j] += ti[j] * osc;
+                }
+            }
+        }
+    };
+    auto acc_chunk = [&](int c) { // bins of the chunk by threads
+        int k0 = c * Kc, nk = std::min(Kc, K - k0), nt = std::min(NTHREAD, nk);
+        std::vector<std::thread> ta;
+        for (int t = 1; t < nt; t++) {
+            ta.emplace_back([&, t]() {
+                for (int k = k0 + t; k < k0 + nk; k += nt) acc_bin(k, tbs.data() + (size_t)t * ATILE * B);
+            });
+        }
+        for (int k = k0; k < k0 + nk; k += nt) acc_bin(k, tbs.data());
+        for (auto &t : ta) t.join();
+    };
+    // done flags of the frames set by the callbacks or by wait(), tagged by the
+    // generation of the call (gok: OK, gerr: error) against late callbacks
+    if (m->ndone < F) {
+        m->done.emplace_back(new std::atomic<uint32_t>[F]);
+        for (int f = 0; f < F; f++) m->done.back()[f] = 0;
+        m->ndone = F;
+    }
+    std::atomic<uint32_t> *done = m->done.back().get();
+    uint32_t gok = (m->gen += 4) + 1, gerr = gok + 1;
+    int fdone = 0, cacc = 0; // frames done in order, next chunk accumulated
+    double tacc = 0.0;
+    auto acc_done = [&](int nf) { // accumulate the chunks of done frames < nf
+        double ta = now();
+        while (fdone < nf && done[fdone] == gok) fdone++;
+        for (; cacc < nch && (cacc + 1) * NW <= fdone; cacc++) acc_chunk(cacc);
+        tacc += now() - ta;
+        return fdone >= nf || done[fdone] != gerr;
+    };
     std::vector<AsyncInferJob> jobs;
     std::vector<int> job_c;  // chunk of the frame of job
     size_t jdone = 0;
@@ -366,7 +441,7 @@ static int search_multi(const float **xs, const int8_t **x8s, int NW,
                 fprintf(stderr, "sdr_acc_hailo: inference error\n");
                 return 0;
             }
-            jdone++;
+            done[jdone++] = gok; // done by wait() (the callback may be later)
         }
         double ta = now();
         // code DFT rolled: C[(k1 + A k2 - s) mod M] = base[k1'][(k2 - r) mod B]
@@ -391,46 +466,37 @@ static int search_multi(const float **xs, const int8_t **x8s, int NW,
             bd.input(m->in_name[2])->set_buffer(MemoryView(cr, M));
             bd.input(m->in_name[3])->set_buffer(MemoryView(ci, M));
             bd.output(m->out_name)->set_buffer(MemoryView(m->out[f].data(), m->out[f].size() * 2));
+            if (!acc_done(f)) {
+                fprintf(stderr, "sdr_acc_hailo: inference error\n");
+                return 0;
+            }
             if (m->cim->wait_for_async_ready(std::chrono::milliseconds(TIMEOUT_MS), 1) != HAILO_SUCCESS) {
                 return 0;
             }
-            auto job = m->cim->run_async({bd});
+            std::atomic<uint32_t> *dp = done + f;
+            auto job = m->cim->run_async({bd}, [dp, gok, gerr](const AsyncInferCompletionInfo &info) {
+                *dp = info.status == HAILO_SUCCESS ? gok : gerr;
+            });
             if (!job) return 0;
             jobs.push_back(job.release());
             job_c.push_back(c);
         }
     }
-    if (getenv("SDR_ACC_HAILO_DEBUG")) fprintf(stderr, "sdr_acc_hailo: F=%d prep %.2f ms\n", F, (tB - tA + tp) * 1e3);
+    double t2 = now();
     for (size_t i = jdone; i < jobs.size(); i++) {
         if (jobs[i].wait(std::chrono::milliseconds(TIMEOUT_MS)) != HAILO_SUCCESS) {
             fprintf(stderr, "sdr_acc_hailo: inference error\n");
             return 0;
         }
+        done[i] = gok;
+        acc_done((int)i + 1);
     }
-    double t2 = now();
-
-    // P[k][B*p1+p2] += out[p2][k*R+p1] * 64 / M^2 * sx^2 * cmax^2 (bins by threads)
-    int Rm = m->R, W = Kc * Rm;
-    th.clear();
-    for (int t = 0; t < NTHREAD; t++) {
-        th.emplace_back([&, t]() {
-            for (int k = t; k < K; k += NTHREAD) {
-                int c = k / Kc, kk = k % Kc;
-                float *p = P + (size_t)k * ldP;
-                for (int w = 0; w < NW; w++) {
-                    const uint16_t *o = m->out[c * NW + w].data();
-                    float osc = (float)(64.0 / ((double)M * M) * sx[w] * sx[w] * cmax * cmax * m->os);
-                    float ozp = m->oz;
-                    for (int p1 = 0; p1 < Rm; p1++) for (int p2 = 0; p2 < B; p2++) {
-                        int n = B * p1 + p2;
-                        if (n < nout) p[n] += ((float)o[(size_t)p2 * W + kk * Rm + p1] - ozp) * osc;
-                    }
-                }
-            }
-        });
-    }
-    for (auto &t : th) t.join();
+    if (!noinfer) for (; cacc < nch; cacc++) acc_chunk(cacc); // all jobs waited
     double t3 = now();
+    if (getenv("SDR_ACC_HAILO_DEBUG")) {
+        fprintf(stderr, "sdr_acc_hailo: F=%d prep %.2f acc %.2f (tail %.2f) ms\n", F,
+            (tB - tA + tp) * 1e3, tacc * 1e3, (t3 - t2) * 1e3);
+    }
     if (prof) {
         prof->t_in = t1 - t0 + tp;
         prof->t_exec = t2 - t1 - tp;
