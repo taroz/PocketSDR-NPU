@@ -1740,3 +1740,60 @@ of 160000) displaced by up to 2 samples (R = 256 / 264: also row 125), used
 with this limitation (2 samples = 0.13 chip of L2CM at 8 MHz). INT8 C/N0 of
 strong L2CM signals (20 ms coherent) ~1 dB lower than `cpu_opt` (also with
 plugin 1.1).
+
+### 14.12 Transfer rate of the Hailo-10H and the input order of the HEFs
+
+**The I/O of the Hailo-10H is not limited by the PCIe link** (Gen3 x1,
+`current_link_speed` 8 GT/s) but by the order of the tensors. HailoRT 5.4 runs
+the inference through an RPC server on the device (`infer_model_hrpc_client`,
+host CPU of `hailortcli` ~0.1 s for 5 s), the tensors of the native order FCR
+are transferred directly, those of the order NHWC are converted on the device.
+One 1x1 Conv (single context, `hailortcli run2`, uint8 in / out, frames per
+second, input rate):
+
+| model (features x width) | order | fps | input MB/s |
+|---|---|---|---|
+| 200 x 240 x H (H = 1, 4, 16, 64, 256) | NHWC | 2038 / 574 / 148 / 37 / 9 | 98-114 |
+| 200 -> 25 (output 1/8), H = 16 | NHWC | 149 | 115 |
+| 256 x 240 | NHWC | 1827 | 112 |
+| 512 x 240 | FCR | 2473 | 304 |
+| 400 x 400 | FCR | 2048 | 328 |
+| 500 x 640 | FCR | 1292 | 413 (826 in + out) |
+| 640 x 500 | NHWC | 207 | 66 |
+
+The NN core of the 200 x 240 x 16 model takes 0.35 ms per frame
+(`--measure-latency`, 2800 fps possible) but runs at 148 fps. (The earlier
+estimate of the I/O limit of 200-220 MB/s in 14.9 was the rate of the NHWC
+conversion.) The acquisition HEFs (batch 16, input + output per frame, rate):
+
+| HEF | inputs (order) | fps | MB/s |
+|---|---|---|---|
+| 48000:7:112 (200 x 240) | all FCR | 777 | 441 |
+| 16000:7:64 (125 x 128) | x NHWC, code FCR | 1218 | 218 |
+| 64000:5:128 (250 x 256) | x FCR, code NHWC | 576 | 336 |
+| 160000:1:200 (400 x 400) | all FCR | 696 | 557 |
+| 320000:1:250 (500 x 640) | x FCR, code NHWC (640 features) | 199 | 318 (code 2 x 64) |
+| **320000:1:200 (400 x 800)** | **all FCR** | **405** | **680** |
+
+The order is chosen by the compiler and is not simply given by the shape
+(features 200 / 320 / 400 of the code input of 16000 by 80 x 200, 64000 by
+200 x 320, 160 x 400 are still NHWC; splitting the 640 features of the code of
+320000 into 320 + 320 or 400 + 240 inputs: NHWC, 270 / 279 fps). Measured
+factorizations: 64000 by 200 x 320 (R = 100) 724 fps but the outputs are
+displaced (+2, +B-6 samples, wrong bins: 75 of 141 offsets, the bug of 14.9),
+160 x 400 701 fps (NHWC); 16000 by 80 x 200 1176 fps (no gain).
+
+**Hailo plugin 1.3**: A, B of a HEF are taken from the input shape; the
+factorization with A, B multiples of 8 is tried first, then that of the RKNN
+generator (`gen_hailo_acq.py M:Kc:R:A`). The L2CM model 320000:1:200:400 is
+correct for all tested code offsets (102, incl. 72 in the first rows where
+the old 320000:1:250 was displaced by up to 2 samples; emulator C/N0 within
+0.2 dB) and the 20 ms direct search of L2CM on the real data (14 PRNs, the
+same detections, code phases and Doppler, C/N0 within 0.3 dB) takes **1260
+ms vs 2291 ms** (plugin 1.2 with 320000:1:250, CPU 875 / 819 ms) vs 3026 ms of
+`cpu_opt` (2.4x). The other signals are unchanged (L1CA 136 ms, E1B 234 ms,
+L1CP 742 ms, CPU governor ondemand).
+
+For the Hailo-8 (no device DRAM, inputs streamed to the on-chip memory), the
+NHWC conversion rate and the FCR rate (500-800 MB/s on the Hailo-10H) should
+be measured first by the same single Conv models.

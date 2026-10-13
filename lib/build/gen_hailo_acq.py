@@ -3,13 +3,17 @@
 #  generate Hailo HEF models of parallel code search for Hailo NPU plugin
 #  (libsdr_acc_hailo.so)
 #
-#  usage: gen_hailo_acq.py [-o dir] [-fs fs] [-sig sig,...] [-n] M:Kc:R ...
+#  usage: gen_hailo_acq.py [-o dir] [-fs fs] [-sig sig,...] [-n] M:Kc:R[:A] ...
 #
 #    M  : DFT size (2 x samples per code period)
 #    Kc : Doppler bins per inference (spaced by fs / M)
 #    R  : output rows of IDFT (nout = R * B <= M / 2, A x B = M), padded to
 #         avoid the corrupted outputs of some multi-context HEFs (verified:
-#         48000:7:112 for 24 MHz, 16000:7:64 for 8 MHz)
+#         48000:7:112 for 24 MHz, 16000:7:64, 64000:5:128, 160000:1:200,
+#         320000:1:200:400 for 8 MHz)
+#    A  : factorization M = A x B (default: factorize(M)), A, B multiples of 8
+#         for the inputs in the native order of the device (e.g. 320000:1:200:400,
+#         the plugin tries A, B multiples of 8 first, then factorize(M))
 #    -o : output directory (default: ../linux/hailo)
 #    -fs: sampling frequency (MHz) of the calibration signals (default: 24)
 #    -sig: codes of the calibration signals, the first two also evaluated
@@ -35,6 +39,7 @@
 #  History:
 #  2026-10-11  1.0  new
 #  2026-10-11  1.1  add option -sig
+#  2026-10-13  1.2  add factorization A in M:Kc:R:A
 #
 import sys, os
 import numpy as np
@@ -184,8 +189,11 @@ if __name__ == '__main__':
         else: shapes.append([int(v) for v in sys.argv[i].split(':')])
         i += 1
     os.makedirs(out_dir, exist_ok=True)
-    for M, Kc, R in shapes:
-        A, B = factorize(M)
+    for shape in shapes:
+        M, Kc, R = shape[:3]
+        A, B = (shape[3], M // shape[3]) if len(shape) > 3 else factorize(M)
+        if A * B != M:
+            print('invalid factorization %d = %d x %d' % (M, A, B)); continue
         name = 'acq_M%d_K%d_R%d_h' % (M, Kc, R)
         file = os.path.join(out_dir, name + '.onnx')
         onnx.save(build(A, B, Kc, R), file)

@@ -28,6 +28,16 @@
 //  - M = 64000 (E1B/E1C at 8 MHz): Kc = 7 could not be allocated (transpose
 //    of the format conversion), Kc = 3 outputs wrong powers with batch > 1,
 //    Kc = 5 / R = 128 verified with batch 16.
+//  - The inputs and outputs of the native order FCR of the device are
+//    transferred at 400-800 MB/s, but those of the order NHWC (e.g. width not
+//    a multiple of 8 in multi-context HEFs) are converted at 60-110 MB/s (e.g.
+//    M = 320000 by A x B = 500 x 640: 199 fps, by 400 x 800: 402 fps, all
+//    inputs FCR, L2CM 20 ms direct search 2291 -> 1260 ms). The order is
+//    chosen by the compiler (not simply by the shape: 64000 by 200 x 320 or
+//    160 x 400 and 16000 by 80 x 200 still have NHWC inputs). The
+//    factorization with A, B multiples of 8 is tried first, then factorize()
+//    (A, B of the HEF by the input shape). Verified: 320000:1:200 (400 x
+//    800); 64000:5:100 (200 x 320) outputs displaced samples (not used).
 //  - The calibration set has to include the codes of 10.23 Mcps (flat code
 //    spectrum normalized by the max magnitude), otherwise the peaks of strong
 //    signals are clipped and the Doppler bin of the max power is wrong.
@@ -55,6 +65,8 @@
 //  2026-10-11  1.1  add model of Kc = 5
 //  2026-10-12  1.2  code DFT rolled by chunk instead of the carrier wipe-off
 //                   of the IF samples per frame (shared DFT identity)
+//  2026-10-13  1.3  factorization of the HEF by the input shape, A, B
+//                   multiples of 8 tried first (native input order)
 //
 #include <stdio.h>
 #include <stdlib.h>
@@ -120,6 +132,20 @@ static int factorize(int M, int *A, int *B)
     return 1;
 }
 
+// DFT size factorization with A, B multiples of 8 (inputs in the native order
+// FCR of the device: NHWC inputs are converted at 60-110 MB/s) ----------------
+static int factorize8(int M, int *A, int *B)
+{
+    int best = 0;
+    for (int a = 8; a * a <= M; a += 8) {
+        if (M % a || (M / a) % 8) continue;
+        best = a;
+    }
+    if (!best) return 0;
+    *A = best; *B = M / best;
+    return 1;
+}
+
 // load HEF model for (M, Kc, R) -----------------------------------------------
 static hmodel_t *get_model(int M, int Kc, int R)
 {
@@ -174,7 +200,13 @@ static hmodel_t *get_model(int M, int Kc, int R)
     }
     m->cim.reset(new ConfiguredInferModel(cim.release()));
     m->M = M; m->Kc = Kc; m->R = R;
-    factorize(M, &m->A, &m->B);
+    auto sh = m->im->input(names[0])->shape(); // xr [1][B][A] (H, W, features)
+    m->A = (int)sh.features; m->B = (int)sh.width;
+    if (m->A * m->B != M) {
+        fprintf(stderr, "sdr_acc_hailo: model shape error %s\n", file.c_str());
+        hmodels[key] = nullptr;
+        return NULL;
+    }
     hmodel_t *p = m.get();
     hmodels[key] = std::move(m);
     return p;
@@ -230,8 +262,10 @@ static int search_multi(const float **xs, const int8_t **x8s, int NW,
     const float *code, int M, double fs, const double *fc, int K, int nout,
     float *P, int ldP, sdr_acc_prof_t *prof)
 {
-    int A, B;
-    if (!vdev || K < 1 || NW < 1 || !factorize(M, &A, &B)) return 0;
+    int fa[2][2] = {{0}}, A, B;
+    if (!vdev || K < 1 || NW < 1) return 0;
+    factorize8(M, &fa[0][0], &fa[0][1]);
+    factorize(M, &fa[1][0], &fa[1][1]);
     std::lock_guard<std::mutex> lock(call_mtx);
     double t0 = now();
 
@@ -239,19 +273,25 @@ static int search_multi(const float **xs, const int8_t **x8s, int NW,
     for (int k = 1; k < K; k++) {
         if (fabs((fc[k] - fc[0]) * M / fs - k) > 1e-3) return 0;
     }
-    // model with the largest Kc (7, 5, 3, 1) and the smallest R >= nout / B
+    // model of the factorization by multiples of 8, then that of factorize(),
+    // with the largest Kc (7, 5, 3, 1) and the smallest R >= nout / B
     // (R < nout / B + 16, R padded for the output features to avoid the
     // corrupted outputs of some multi-context HEFs) (a frame of Kc = 7 takes
     // about the same time as that of Kc = 1, the bins >= K are not used)
-    int R = (nout + B - 1) / B;
     hmodel_t *m = NULL;
     static const int kcs[] = {7, 5, 3, 1};
-    for (int i = 0; i < 4 && !m; i++) {
-        for (int r = R; r < R + 16 && !m; r++) {
-            m = get_model(M, kcs[i], r);
+    for (int j = 0; j < 2 && !m; j++) {
+        if (!fa[j][0]) continue;
+        int R = (nout + fa[j][1] - 1) / fa[j][1];
+        for (int i = 0; i < 4 && !m; i++) {
+            for (int r = R; r < R + 16 && !m; r++) {
+                m = get_model(M, kcs[i], r);
+                if (m && (m->A != fa[j][0] || m->B != fa[j][1])) m = NULL;
+            }
         }
     }
     if (!m) return 0;
+    A = m->A; B = m->B;
     int Kc = m->Kc, nch = (K + Kc - 1) / Kc, F = NW * nch;
 
     // RMS of the windows and code DFT normalized by max magnitude
