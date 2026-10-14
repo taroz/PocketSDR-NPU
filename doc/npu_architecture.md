@@ -1955,3 +1955,53 @@ mean of 2 runs alternated, plugin 1.3 -> 1.4):
 
 (one core, `taskset -c 3`: L1CP 787 -> 702 ms, L2CM 1443 -> 1253 ms, E1B
 223 -> 182 ms.)
+
+### 14.15 Hailo-8 (Raspberry Pi 5 + AI HAT+, plugin 1.5)
+
+The Hailo-10H of the Pi 5 replaced by a Hailo-8 (26 TOPS, PCIe Gen3 x1):
+HailoRT 4.24.0 and `hailort-pcie-driver` 4.24.0 (Hailo Developer Zone debs,
+the driver built without DKMS for kernel 6.18.50+rpt-rpi-2712), HEFs by
+`gen_hailo_acq.py -arch hailo8` (Dataflow Compiler 3.34.0, x86) in
+`lib/linux/hailo8` (plugin option `hef=`). The plugin source is the same as
+for the Hailo-10H (built with HailoRT 4.24).
+
+- **Allocation**: only single-context HEFs are allocated on the Hailo-8,
+  about Kc x M <= 150000 and Kc x A <= 900 (16000:7 by 80 x 200 and
+  125 x 128, 48000:3 by 160 x 300, 64000:2 by 160 x 400). The multi-context
+  ones fail (`16x4 is not supported` of the element-wise layers, `ew_mult1`
+  not assigned, partition timeout in 3 h), incl. Kc = 5 / 7 of M = 48000,
+  Kc = 9 / 11 / 15 / 21 of M = 16000, Kc >= 3 of M = 64000 and the long codes
+  (160000:1, 320000:1). An all 8-bit model (`-q8`, no 16-bit tail) does not
+  help (48000:7, 16000:11).
+- **Displaced outputs**: some single-context HEFs output displaced samples as
+  the multi-context ones of the Hailo-10H; L1CA (few satellites) shows them by
+  false peaks at the code offset 0, L5I does not. Displaced: 48000:3 by
+  200 x 240 (R = 112), 150 x 320, 120 x 400, 96 x 500, 80 x 600, 64000:2 by
+  80 x 800. Correct: the models of the table below and 48000:1 by 200 x 240,
+  64000:1 / 2 by 200 x 320, 64000:2 by 128 x 500 and 100 x 640, 16000:7 by
+  125 x 128, 100 x 160 and 50 x 320.
+- **Model selection (plugin 1.5)**: the HEFs in `hef_dir` are listed at the
+  initialization and the model of M with the fewest chunks is used (then by
+  the factorization of multiples of 8, swapped, `factorize()`, others, then
+  the smallest Kc and R), so any Kc and factorization (e.g. 160 x 300) can be
+  used.
+- **Backend option length**: `sdr_acc_init()` copied the backend string to
+  64 bytes (`hailo:hef=<long path>,batch=16` lost `batch=16`, the frames not
+  batched: 48000:3 126 -> 90 ms with batch 16); now 256 bytes.
+
+Search time per signal on the Pi 5 (`bench_sdr_acq`, real data, all 32 PRNs,
+batch 16, detections and code offsets identical to the CPU reference within
+1 sample), Hailo-10H of 14.14 for reference:
+
+| signal | model (A x B) | fps | search (ms) | CPU (ms) | Hailo-10H (ms) |
+|---|---|---|---|---|---|
+| L1CA 8 MHz (M = 16000) | 16000:7:48 (80 x 200) | 2093 | 22.9 | 38 | 74 |
+| L1CA 24 MHz (M = 48000) | 48000:3:88 (160 x 300) | 1323 | 90.6 | 119 | 131 |
+| L5I 24 MHz | 48000:3:88 (160 x 300) | 1323 | 88.9 | 111 | 101 |
+| E1B (M = 64000) | 64000:2:88 (160 x 400) | 1824 | 87.5 | 133 | 178 |
+| L1CP, L2CM | - (CPU) | - | - | - | 702, 1330 |
+
+(Other correct models: 16000:7:64 by 125 x 128 31.0 ms, 16000:7:56 by
+100 x 160 32.4 ms, 16000:7:40 by 50 x 320 43.2 ms, 48000:1:112 by 200 x 240
+113.5 ms, 64000:2:112 by 200 x 320 96.1 ms, 64000:2:72 by 128 x 500 90.0 ms,
+64000:1:112 by 200 x 320 140.9 ms.)

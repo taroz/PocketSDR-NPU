@@ -2,9 +2,10 @@
 //  Pocket SDR - Accelerator Backend Plugin for Hailo NPU (HailoRT).
 //
 //  The parallel code search of the Doppler bins is executed on a Hailo NPU
-//  (e.g. Hailo-10H of Raspberry Pi AI HAT+ 2) by a HEF compiled with the Hailo
-//  Dataflow Compiler from the ONNX model of a carrier folded four-step DFT
-//  (bins in the channels, batch 1, see doc/npu_architecture.md):
+//  (e.g. Hailo-10H of Raspberry Pi AI HAT+ 2, Hailo-8 of AI HAT+) by a HEF
+//  compiled with the Hailo Dataflow Compiler from the ONNX model of a carrier
+//  folded four-step DFT (bins in the channels, batch 1, see
+//  doc/npu_architecture.md):
 //
 //    host: carrier wipe-off of x by the first bin of the chunk, unit RMS
 //          x[n1,n2] (n = B*n1+n2) -> NHWC [1][n2][n1] (float, quantized by
@@ -49,6 +50,16 @@
 //    frame about 0.8 ms), 200 x 80 (all FCR) 1241 fps but displaced outputs
 //    (R = 100); Kc = 11, 15, 21 not allocated in 40 min - 3 days.
 //
+//  Notes on HEFs (Dataflow Compiler 3.34.0, HailoRT 4.24.0, Hailo-8, -arch
+//  hailo8 of gen_hailo_acq.py, HEFs in ../linux/hailo8 by option hef=):
+//  - Only single-context HEFs are allocated (about Kc x M <= 150000 and Kc x A
+//    <= 900): multi-context ones fail (16-bit or wide element-wise layers not
+//    supported, partition timeout) incl. the long codes (M >= 160000).
+//  - Verified on the device by the peak positions of L1CA (L5I does not show
+//    the displaced outputs): 16000:7:48 (80 x 200), 48000:3:88 (160 x 300),
+//    64000:2:88 (160 x 400, E1B). Displaced: 48000:3 by 200 x 240 (R = 112),
+//    150 x 320, 120 x 400, 96 x 500, 80 x 600, 64000:2 by 80 x 800.
+//
 //  All windows of an acquisition are searched in one call by
 //  search_code_i8_multi() (the frames of the windows and chunks queued at
 //  once), which is much faster with the batch size 8-16 than the call per
@@ -78,6 +89,8 @@
 //  2026-10-13  1.4  outputs accumulated by chunk overlapped with the
 //                   inference (transposed by tiles, bins by threads), model
 //                   of the fewest chunks (Kc up to 21)
+//  2026-10-14  1.5  model selected from the HEFs in hef_dir (any Kc, any
+//                   factorization A x B), Hailo-8 (HailoRT 4.24)
 //
 #include <stdio.h>
 #include <stdlib.h>
@@ -85,6 +98,7 @@
 #include <math.h>
 #include <time.h>
 #include <dlfcn.h>
+#include <dirent.h>
 #include <string>
 #include <vector>
 #include <map>
@@ -94,6 +108,7 @@
 #include <algorithm>
 #include <thread>
 #include <atomic>
+#include <array>
 #include <hailo/hailort.hpp>
 #include "sdr_acc.h"
 
@@ -124,6 +139,7 @@ static int batch_size = 0;              // batch size (0: HailoRT default)
 static std::unique_ptr<VDevice> vdev;
 static std::map<std::string, std::unique_ptr<hmodel_t>> hmodels;
 static std::string hef_dir;
+static std::vector<std::array<int, 3>> hefs; // HEFs in hef_dir (M, Kc, R)
 static std::mutex call_mtx;
 
 // current time (s) ------------------------------------------------------------
@@ -295,25 +311,26 @@ static int search_multi(const float **xs, const int8_t **x8s, int NW,
     for (int k = 1; k < K; k++) {
         if (fabs((fc[k] - fc[0]) * M / fs - k) > 1e-3) return 0;
     }
-    // model of the factorization by multiples of 8, swapped, then that of
-    // factorize(), with the fewest chunks of K bins (then the smallest Kc of
-    // 1, 3, 5, 7, 11, 15, 21) and the smallest R >= nout / B (R < nout / B +
+    // model of the HEFs of M with the fewest chunks of K bins, then by the
+    // factorization (multiples of 8, swapped, factorize(), others of the HEFs
+    // in hef_dir), then the smallest Kc and R, R >= nout / B (R < nout / B +
     // 16, R padded for the output features to avoid the corrupted outputs of
     // some multi-context HEFs) (a frame takes about 0.8 ms or more by the
     // overhead of the device, nearly independent of Kc for small M, the bins
     // >= K are not used)
     hmodel_t *m = NULL;
-    static const int kcs[] = {1, 3, 5, 7, 11, 15, 21};
-    for (int j = 0; j < 3 && !m; j++) {
-        if (!fa[j][0]) continue;
-        int R = (nout + fa[j][1] - 1) / fa[j][1];
-        for (int i = 0; i < 7; i++) { // fewest chunks, then smallest Kc
-            hmodel_t *mi = NULL;
-            for (int r = R; r < R + 16 && !mi; r++) {
-                mi = get_model(M, kcs[i], r);
-                if (mi && (mi->A != fa[j][0] || mi->B != fa[j][1])) mi = NULL;
-            }
-            if (mi && (!m || (K + kcs[i] - 1) / kcs[i] < (K + m->Kc - 1) / m->Kc)) m = mi;
+    int mrank[4] = {0};
+    for (auto &h : hefs) {
+        if (h[0] != M) continue;
+        hmodel_t *mi = get_model(M, h[1], h[2]);
+        if (!mi) continue;
+        int R = (nout + mi->B - 1) / mi->B, j = 0;
+        if (mi->R < R || mi->R >= R + 16) continue;
+        while (j < 3 && (mi->A != fa[j][0] || mi->B != fa[j][1])) j++;
+        int rank[4] = {(K + mi->Kc - 1) / mi->Kc, j, mi->Kc, mi->R};
+        if (!m || std::lexicographical_compare(rank, rank + 4, mrank, mrank + 4)) {
+            m = mi;
+            std::copy(rank, rank + 4, mrank);
         }
     }
     if (!m) return 0;
@@ -568,6 +585,16 @@ static int acc_init(const char *opt)
             size_t i = f.find_last_of('/');
             hef_dir = (i == std::string::npos ? std::string(".") : f.substr(0, i)) + "/hailo";
         }
+    }
+    hefs.clear();
+    if (DIR *dp = opendir(hef_dir.c_str())) {
+        while (struct dirent *e = readdir(dp)) {
+            int M, Kc, R, n = 0;
+            if (sscanf(e->d_name, "acq_M%d_K%d_R%d_h.hef%n", &M, &Kc, &R, &n) == 3 &&
+                n == (int)strlen(e->d_name)) hefs.push_back({M, Kc, R});
+        }
+        closedir(dp);
+        std::sort(hefs.begin(), hefs.end());
     }
     auto v = VDevice::create();
     if (!v) {

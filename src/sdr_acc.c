@@ -49,7 +49,7 @@
 
 // global variables ------------------------------------------------------------
 static int acc_type = SDR_ACC_CPU;         // backend type
-static char acc_name[64] = "cpu";          // backend name
+static char acc_name[256] = "cpu";         // backend name
 static const sdr_acc_plugin_t *acc_plugin = NULL; // backend plugin
 static void *acc_lib = NULL;               // backend plugin library handle
 static sdr_acc_stat_t acc_stat = {0};      // backend statistics
@@ -197,7 +197,7 @@ static int load_plugin(const char *name, const char *opt, void **lib_p,
 //
 int sdr_acc_init(const char *backend)
 {
-    char name[64], *opt;
+    char name[256], *opt;
 
     sdr_acc_exit();
     if (!strcmp(backend, "cpu")) {

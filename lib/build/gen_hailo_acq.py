@@ -3,7 +3,8 @@
 #  generate Hailo HEF models of parallel code search for Hailo NPU plugin
 #  (libsdr_acc_hailo.so)
 #
-#  usage: gen_hailo_acq.py [-o dir] [-fs fs] [-sig sig,...] [-n] M:Kc:R[:A] ...
+#  usage: gen_hailo_acq.py [-arch arch] [-o dir] [-fs fs] [-sig sig,...] [-n]
+#             [-q8] [-ms cmds] M:Kc:R[:A] ...
 #
 #    M  : DFT size (2 x samples per code period)
 #    Kc : Doppler bins per inference (spaced by fs / M)
@@ -14,11 +15,15 @@
 #    A  : factorization M = A x B (default: factorize(M)), A, B multiples of 8
 #         for the inputs in the native order of the device (e.g. 320000:1:200:400,
 #         the plugin tries A, B multiples of 8 first, then factorize(M))
-#    -o : output directory (default: ../linux/hailo)
+#    -arch: target device (hailo10h: Dataflow Compiler 5.x, hailo8: 3.x)
+#         (default: hailo10h)
+#    -o : output directory (default: ../linux/hailo, ../linux/hailo8 for hailo8)
 #    -fs: sampling frequency (MHz) of the calibration signals (default: 24)
 #    -sig: codes of the calibration signals, the first two also evaluated
 #         (default: L1CA,L5I,B1I,E5AI, e.g. E1B,E1C for 64000 at 8 MHz)
 #    -n : no compile (ONNX, quantization and emulator evaluation only)
+#    -q8: all layers 8-bit (no 16-bit tail)
+#    -ms: model script commands added, separated by ';'
 #
 #  The model (inputs xr, xi [1][n1][1][n2], IF samples wiped by the carrier of
 #  the first bin and normalized by RMS, cr, ci [1][k2][1][k1], code DFT
@@ -40,6 +45,7 @@
 #  2026-10-11  1.0  new
 #  2026-10-11  1.1  add option -sig
 #  2026-10-13  1.2  add factorization A in M:Kc:R:A
+#  2026-10-14  1.3  add options -arch, -q8, -ms
 #
 import sys, os
 import numpy as np
@@ -65,9 +71,9 @@ def build(A, B, Kc, R):
         k = np.asarray(rows)[:, None] * np.arange(n)[None, :]
         return np.exp(sgn * 2j * np.pi * (k % n) / n) / np.sqrt(n)
     def cconv(xr, xi, w, group=1): # complex 1x1 conv by 3 real convs
-        c1 = op('Conv', [op('Add', [xr, xi]), const(w.real[:, :, None, None])], group=group)
-        yr = op('Add', [op('Conv', [xi, const(-(w.real + w.imag)[:, :, None, None])], group=group), c1])
-        yi = op('Add', [op('Conv', [xr, const((w.imag - w.real)[:, :, None, None])], group=group), c1])
+        c1 = op('Conv', [op('Add', [xr, xi]), const(w.real[:, :, None, None])], group=group, kernel_shape=[1, 1])
+        yr = op('Add', [op('Conv', [xi, const(-(w.real + w.imag)[:, :, None, None])], group=group, kernel_shape=[1, 1]), c1])
+        yi = op('Add', [op('Conv', [xr, const((w.imag - w.real)[:, :, None, None])], group=group, kernel_shape=[1, 1]), c1])
         return yr, yi
     def cmul(ar, ai, br, bi):
         return (op('Sub', [op('Mul', [ar, br]), op('Mul', [ai, bi])]),
@@ -131,9 +137,10 @@ def sig_input(rng, A, B, Kc, fs, cn0, sig, fd_bins=None):
     return [xs.real, xs.imag, cs.real, cs.imag], x, c
 
 # quantize, evaluate and compile by Dataflow Compiler ---------------------------
-def gen_hef(onnx_file, name, A, B, Kc, R, fs, out_dir, nocomp):
+def gen_hef(onnx_file, name, A, B, Kc, R, fs, out_dir, nocomp, arch='hailo10h',
+    q8=False, ms=''):
     from hailo_sdk_client import ClientRunner, InferenceContext
-    r = ClientRunner(hw_arch='hailo10h')
+    r = ClientRunner(hw_arch=arch)
     r.translate_onnx_model(onnx_file, name)
     hn = r.get_hn_dict()['layers']
     ins = sorted(k for k, v in hn.items() if v['type'] == 'input_layer') # xr, xi, cr, ci
@@ -150,8 +157,9 @@ def gen_hef(onnx_file, name, A, B, Kc, R, fs, out_dir, nocomp):
         d, _, _ = sig_input(rng, A, B, Kc, fs, rng.uniform(30, 58) if i % 4 else 0,
             SIGS[(i // 4) % len(SIGS)])
         for j in range(4): cal[j].append(nhwc(d[j])[0])
-    r.load_model_script('model_optimization_flavor(optimization_level=0, compression_level=0)\n'
-        'quantization_param([%s], precision_mode=a16_w16)\n' % ', '.join(tail))
+    r.load_model_script('model_optimization_flavor(optimization_level=0, compression_level=0)\n' +
+        ('' if q8 else 'quantization_param([%s], precision_mode=a16_w16)\n' % ', '.join(tail)) +
+        ''.join(l + '\n' for l in ms.split(';') if l))
     r.optimize({ins[j]: np.stack(cal[j]) for j in range(4)})
     print('sig  C/N0  peak_pos  dCN0(q-ref) mean/std  NRMSE  peak(q/ref)')
     M, N = A * B, A * B // 2
@@ -178,16 +186,22 @@ def gen_hef(onnx_file, name, A, B, Kc, R, fs, out_dir, nocomp):
         print('%s: %d bytes' % (file, len(hef)))
 
 if __name__ == '__main__':
-    out_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), '../linux/hailo')
+    out_dir, arch, q8, ms = None, 'hailo10h', False, ''
     fs, nocomp, shapes = 24e6, False, []
     i = 1
     while i < len(sys.argv):
         if sys.argv[i] == '-o': out_dir = sys.argv[i + 1]; i += 1
+        elif sys.argv[i] == '-arch': arch = sys.argv[i + 1]; i += 1
         elif sys.argv[i] == '-fs': fs = float(sys.argv[i + 1]) * 1e6; i += 1
         elif sys.argv[i] == '-sig': SIGS[:] = sys.argv[i + 1].split(','); i += 1
         elif sys.argv[i] == '-n': nocomp = True
+        elif sys.argv[i] == '-q8': q8 = True
+        elif sys.argv[i] == '-ms': ms = sys.argv[i + 1]; i += 1
         else: shapes.append([int(v) for v in sys.argv[i].split(':')])
         i += 1
+    if not out_dir:
+        out_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+            '../linux/hailo8' if arch == 'hailo8' else '../linux/hailo')
     os.makedirs(out_dir, exist_ok=True)
     for shape in shapes:
         M, Kc, R = shape[:3]
@@ -198,4 +212,4 @@ if __name__ == '__main__':
         file = os.path.join(out_dir, name + '.onnx')
         onnx.save(build(A, B, Kc, R), file)
         print('%s: A=%d B=%d ONNX vs FFT NRMSE=%.2e' % (name, A, B, check(file, A, B, Kc, R)))
-        gen_hef(file, name, A, B, Kc, R, fs, out_dir, nocomp)
+        gen_hef(file, name, A, B, Kc, R, fs, out_dir, nocomp, arch, q8, ms)
