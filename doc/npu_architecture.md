@@ -2005,3 +2005,54 @@ batch 16, detections and code offsets identical to the CPU reference within
 100 x 160 32.4 ms, 16000:7:40 by 50 x 320 43.2 ms, 48000:1:112 by 200 x 240
 113.5 ms, 64000:2:112 by 200 x 320 96.1 ms, 64000:2:72 by 128 x 500 90.0 ms,
 64000:1:112 by 200 x 320 140.9 ms.)
+
+### 14.16 Shared DFT models for the Hailo-8 and the bias of the code offset 0
+
+**Shared DFT model** (`gen_hailo_acq.py -sh`, `acq_M<M>_K<Kc>_R<R>_hs.hef`):
+the inputs are the unitary DFT X of the IF samples (wiped by the carrier of
+the first bin, computed once per window on the host by FFTW, [1][k2][1][k1]
+of X[A k2 + k1]) and the code DFT; the bins of a chunk are the shifts of X
+(`Slice` / `Concat`), the chunks the rolled code DFT of the host (as plugin
+1.2). The first DFT stage (the largest layer) and a transpose are removed
+(ONNX vs FFT NRMSE 4e-7, the quantized C/N0 within 0.2 dB as the original
+model, allocation 1 min vs 6.5 min for 48000:3). The plugin prefers a shared
+DFT model of the same number of chunks (links `-lfftw3f`).
+
+- Single context for M = 192000 (E1B 24 MHz) and 160000 (L1CP 8 MHz) at
+  Kc = 1, not allocatable with the original model. Not allocated: Kc >= 5
+  of M = 48000, Kc = 2 of M = 192000, Kc = 5 of M = 64000, 16000:15,
+  320000:1 (L2CM 8 MHz). 16000:7 by 80 x 200 becomes 3 contexts (185 fps,
+  118 ms vs 22.9 ms): the shifts of X cost as many layers as the bins.
+- The time per search is limited by the input format (NHWC inputs converted
+  by HailoRT when A or B is not a multiple of 8) and by the host (E1B 8 MHz:
+  CPU 130 ms > 88 ms search for any model): 48000:3 by 200 x 240 (FCR
+  inputs) 74 ms vs 90 ms of the original 160 x 300 model; E1B 8 MHz 88-93 ms
+  for all models.
+
+**Bias of the code offset 0**: the "displaced outputs" of the Hailo-8 HEFs in
+14.15 were a bias of the power at the code offset 0 (the DC of the IDFTs), the
+same for all bins and windows and independent of the input (+40% of the mean
+power for 160 x 300, +250% for 200 x 240, false peaks of L1CA at the offset
+0), from the quantization of the model (the bias correction of the Dataflow
+Compiler does not remove it). The plugin replaces P[k][0] by the mean of the
+neighbors (circular, a true peak at the offset 0 is found at +-1 sample).
+With it all the Hailo-8 HEFs of 14.15 give the same detections and code
+offsets as the CPU except 48000:3 by 96 x 500 (one false detection).
+
+Search time per signal on the Pi 5 with the HEF set of the Hailo-8 (all 32
+PRNs, batch 16, one process, the same detections and code offsets as the
+CPU), `cpu_opt` and FFTW `cpu` without wisdom on the same day:
+
+| signal | model (A x B) | search (ms) | CPU (ms) | `cpu_opt` (ms) | FFTW `cpu` (ms) |
+|---|---|---|---|---|---|
+| L1CA 24 MHz | 48000:3:108 hs (200 x 240) | 73.5 | 103 | 274 | 521 |
+| L5I 24 MHz | 48000:3:108 hs (200 x 240) | 73.6 | 105 | 274 | 520 |
+| E1B 24 MHz | 192000:1:200 hs (400 x 480) | 460 | 296 | 1822 | 3537 |
+| L1CA 8 MHz | 16000:7:48 (80 x 200) | 22.6 | 38 | 69 | 132 |
+| E1B 8 MHz | 64000:2:88 (160 x 400) | 87.4 | 135 | 323 | 616 |
+| L1CP 8 MHz | 160000:1:200 hs (400 x 400) | 410 | 272 | 1229 | 2617 |
+| L2CM 8 MHz | - (CPU) | - | - | 3525 | 7346 |
+
+The Hailo-8 is 3.0-4.0x faster than `cpu_opt` (shared DFT on the CPU) and
+5.8-7.7x than FFTW `cpu`. Long codes with the decimation: all but L2CM (20 ms)
+on the Hailo-8 (B1CP/L1CD/B1CD share the model of L1CP, not verified).

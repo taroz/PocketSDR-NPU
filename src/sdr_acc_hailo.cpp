@@ -109,6 +109,7 @@
 #include <thread>
 #include <atomic>
 #include <array>
+#include <fftw3.h>
 #include <hailo/hailort.hpp>
 #include "sdr_acc.h"
 
@@ -124,7 +125,7 @@ struct hmodel_t {
     std::unique_ptr<ConfiguredInferModel> cim;
     std::string in_name[4];             // xr, xi, cr, ci
     std::string out_name;
-    int M = 0, Kc = 0, R = 0, A = 0, B = 0;
+    int M = 0, Kc = 0, R = 0, A = 0, B = 0, sh = 0; // sh: shared DFT model
     float qs[4], qz[4], os = 1.0f, oz = 0.0f; // quantization of inputs/output
     std::vector<std::vector<uint8_t>> xr, xi;  // IF samples per window
     std::vector<uint8_t> cr, ci;               // code DFT [k1][k2]
@@ -139,7 +140,7 @@ static int batch_size = 0;              // batch size (0: HailoRT default)
 static std::unique_ptr<VDevice> vdev;
 static std::map<std::string, std::unique_ptr<hmodel_t>> hmodels;
 static std::string hef_dir;
-static std::vector<std::array<int, 3>> hefs; // HEFs in hef_dir (M, Kc, R)
+static std::vector<std::array<int, 4>> hefs; // HEFs in hef_dir (M, Kc, R, sh)
 static std::mutex call_mtx;
 
 // current time (s) ------------------------------------------------------------
@@ -177,11 +178,11 @@ static int factorize8(int M, int *A, int *B)
     return 1;
 }
 
-// load HEF model for (M, Kc, R) -----------------------------------------------
-static hmodel_t *get_model(int M, int Kc, int R)
+// load HEF model for (M, Kc, R, sh) -------------------------------------------
+static hmodel_t *get_model(int M, int Kc, int R, int sh)
 {
     char key[64];
-    snprintf(key, sizeof(key), "acq_M%d_K%d_R%d_h", M, Kc, R);
+    snprintf(key, sizeof(key), "acq_M%d_K%d_R%d_h%s", M, Kc, R, sh ? "s" : "");
     auto it = hmodels.find(key);
     if (it != hmodels.end()) return it->second.get();
     std::string file = hef_dir + "/" + key + ".hef";
@@ -230,9 +231,10 @@ static hmodel_t *get_model(int M, int Kc, int R)
         return NULL;
     }
     m->cim.reset(new ConfiguredInferModel(cim.release()));
-    m->M = M; m->Kc = Kc; m->R = R;
-    auto sh = m->im->input(names[0])->shape(); // xr [1][B][A] (H, W, features)
-    m->A = (int)sh.features; m->B = (int)sh.width;
+    m->M = M; m->Kc = Kc; m->R = R; m->sh = sh;
+    auto s = m->im->input(names[0])->shape(); // xr [1][B][A] (H, W, features)
+    m->A = (int)(sh ? s.width : s.features); // sh: X [1][A][B]
+    m->B = (int)(sh ? s.features : s.width);
     if (m->A * m->B != M) {
         fprintf(stderr, "sdr_acc_hailo: model shape error %s\n", file.c_str());
         hmodels[key] = nullptr;
@@ -290,6 +292,42 @@ static void prep_frame(const hmodel_t *m, const float *x, const int8_t *x8,
     else prep_frame_t(m->A, m->B, x8, tab, sr, si, zr, zi, xr, xi);
 }
 
+// quantize the unitary DFT of IF samples of a window wiped by a carrier table --
+//   (shared DFT model: X [k1][k2] of X[A*k2+k1], FFT by FFTW, buffers of M)
+static std::map<int, fftwf_plan> fplans; // FFTW plans by M (by call_mtx)
+
+static fftwf_plan get_plan(int M)
+{
+    auto it = fplans.find(M);
+    if (it != fplans.end()) return it->second;
+    fftwf_complex *a = fftwf_alloc_complex(M), *b = fftwf_alloc_complex(M);
+    fftwf_plan p = fftwf_plan_dft_1d(M, a, b, FFTW_FORWARD, FFTW_ESTIMATE);
+    fftwf_free(a); fftwf_free(b);
+    return fplans[M] = p;
+}
+
+template <typename T>
+static void prep_frame_sh(const hmodel_t *m, const T *__restrict x,
+    const float *__restrict tab, double sx, fftwf_complex *in, fftwf_complex *out,
+    uint8_t *__restrict xr, uint8_t *__restrict xi)
+{
+    int M = m->M, A = m->A, B = m->B;
+    for (int n = 0; n < M; n++) {
+        float re = x[2*n], im = x[2*n+1], cr = tab[2*n], ci = tab[2*n+1];
+        in[n][0] = re * cr - im * ci; in[n][1] = re * ci + im * cr;
+    }
+    fftwf_execute_dft(get_plan(M), in, out);
+    float sr = (float)(1.0 / sqrt((double)M) / sx / m->qs[0]);
+    float si = (float)(1.0 / sqrt((double)M) / sx / m->qs[1]);
+    float zr = m->qz[0] + 0.5f, zi = m->qz[1] + 0.5f;
+    for (int k2 = 0; k2 < B; k2++) for (int k1 = 0; k1 < A; k1++) {
+        const float *o = out[A * k2 + k1];
+        float q1 = o[0] * sr + zr, q2 = o[1] * si + zi;
+        xr[k1 * B + k2] = (uint8_t)(q1 < 0.f ? 0.f : (q1 > 255.f ? 255.f : q1));
+        xi[k1 * B + k2] = (uint8_t)(q2 < 0.f ? 0.f : (q2 > 255.f ? 255.f : q2));
+    }
+}
+
 // parallel code search of NW windows (non-coherent integration) -------------
 //   the IF samples of the windows are prepared by NTHREAD threads and the
 //   frames (chunks of bins x windows) run asynchronously (batched by HailoRT)
@@ -311,26 +349,27 @@ static int search_multi(const float **xs, const int8_t **x8s, int NW,
     for (int k = 1; k < K; k++) {
         if (fabs((fc[k] - fc[0]) * M / fs - k) > 1e-3) return 0;
     }
-    // model of the HEFs of M with the fewest chunks of K bins, then by the
-    // factorization (multiples of 8, swapped, factorize(), others of the HEFs
-    // in hef_dir), then the smallest Kc and R, R >= nout / B (R < nout / B +
+    // model of the HEFs of M with the fewest chunks of K bins, then the shared
+    // DFT models, then by the factorization (multiples of 8, swapped,
+    // factorize(), others of the HEFs in hef_dir), then the smallest Kc and R,
+    // R >= nout / B (R < nout / B +
     // 16, R padded for the output features to avoid the corrupted outputs of
     // some multi-context HEFs) (a frame takes about 0.8 ms or more by the
     // overhead of the device, nearly independent of Kc for small M, the bins
     // >= K are not used)
     hmodel_t *m = NULL;
-    int mrank[4] = {0};
+    int mrank[5] = {0};
     for (auto &h : hefs) {
         if (h[0] != M) continue;
-        hmodel_t *mi = get_model(M, h[1], h[2]);
+        hmodel_t *mi = get_model(M, h[1], h[2], h[3]);
         if (!mi) continue;
         int R = (nout + mi->B - 1) / mi->B, j = 0;
         if (mi->R < R || mi->R >= R + 16) continue;
         while (j < 3 && (mi->A != fa[j][0] || mi->B != fa[j][1])) j++;
-        int rank[4] = {(K + mi->Kc - 1) / mi->Kc, j, mi->Kc, mi->R};
-        if (!m || std::lexicographical_compare(rank, rank + 4, mrank, mrank + 4)) {
+        int rank[5] = {(K + mi->Kc - 1) / mi->Kc, !mi->sh, j, mi->Kc, mi->R};
+        if (!m || std::lexicographical_compare(rank, rank + 5, mrank, mrank + 5)) {
             m = mi;
-            std::copy(rank, rank + 4, mrank);
+            std::copy(rank, rank + 5, mrank);
         }
     }
     if (!m) return 0;
@@ -380,13 +419,27 @@ static int search_multi(const float **xs, const int8_t **x8s, int NW,
     for (int f = 0; f < F; f++) m->out[f].resize((size_t)B * Kc * m->R);
     std::vector<float> tab(2 * M);
     carr_table(fc[0] / fs, M, B, tab.data());
+    if (m->sh) get_plan(M);
     std::vector<std::thread> th;
     for (int t = 0; t < NTHREAD; t++) {
         th.emplace_back([&, t]() {
+            fftwf_complex *in = NULL, *out = NULL;
+            if (m->sh) { in = fftwf_alloc_complex(M); out = fftwf_alloc_complex(M); }
             for (int w = t; w < NW; w += NTHREAD) {
-                prep_frame(m, xs ? xs[w] : NULL, x8s ? x8s[w] : NULL, tab.data(),
-                    sx[w], m->xr[w].data(), m->xi[w].data());
+                if (!m->sh) {
+                    prep_frame(m, xs ? xs[w] : NULL, x8s ? x8s[w] : NULL, tab.data(),
+                        sx[w], m->xr[w].data(), m->xi[w].data());
+                }
+                else if (xs) {
+                    prep_frame_sh(m, xs[w], tab.data(), sx[w], in, out,
+                        m->xr[w].data(), m->xi[w].data());
+                }
+                else {
+                    prep_frame_sh(m, x8s[w], tab.data(), sx[w], in, out,
+                        m->xr[w].data(), m->xi[w].data());
+                }
             }
+            if (in) { fftwf_free(in); fftwf_free(out); }
         });
     }
     for (auto &t : th) t.join();
@@ -509,6 +562,13 @@ static int search_multi(const float **xs, const int8_t **x8s, int NW,
         acc_done((int)i + 1);
     }
     if (!noinfer) for (; cacc < nch; cacc++) acc_chunk(cacc); // all jobs waited
+    // code offset 0 (DC of the IDFTs) biased by the quantization of the model
+    // (+40-250% of the mean power, independent of the input): replaced by the
+    // neighbors (circular for nout = M / 2)
+    for (int k = 0; k < K && nout > 1; k++) {
+        float *p = P + (size_t)k * ldP;
+        p[0] = nout == M / 2 ? 0.5f * (p[1] + p[nout - 1]) : p[1];
+    }
     double t3 = now();
     if (getenv("SDR_ACC_HAILO_DEBUG")) {
         fprintf(stderr, "sdr_acc_hailo: F=%d prep %.2f acc %.2f (tail %.2f) ms\n", F,
@@ -589,9 +649,11 @@ static int acc_init(const char *opt)
     hefs.clear();
     if (DIR *dp = opendir(hef_dir.c_str())) {
         while (struct dirent *e = readdir(dp)) {
-            int M, Kc, R, n = 0;
+            int M, Kc, R, n = 0, ns = 0;
             if (sscanf(e->d_name, "acq_M%d_K%d_R%d_h.hef%n", &M, &Kc, &R, &n) == 3 &&
-                n == (int)strlen(e->d_name)) hefs.push_back({M, Kc, R});
+                n == (int)strlen(e->d_name)) hefs.push_back({M, Kc, R, 0});
+            else if (sscanf(e->d_name, "acq_M%d_K%d_R%d_hs.hef%n", &M, &Kc, &R, &ns) == 3 &&
+                ns == (int)strlen(e->d_name)) hefs.push_back({M, Kc, R, 1});
         }
         closedir(dp);
         std::sort(hefs.begin(), hefs.end());
@@ -607,6 +669,8 @@ static int acc_init(const char *opt)
 
 static void acc_exit(void)
 {
+    for (auto &p : fplans) fftwf_destroy_plan(p.second);
+    fplans.clear();
     hmodels.clear();
     vdev.reset();
 }

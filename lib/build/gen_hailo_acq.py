@@ -4,7 +4,7 @@
 #  (libsdr_acc_hailo.so)
 #
 #  usage: gen_hailo_acq.py [-arch arch] [-o dir] [-fs fs] [-sig sig,...] [-n]
-#             [-q8] [-ms cmds] M:Kc:R[:A] ...
+#             [-q8] [-ms cmds] [-sh] M:Kc:R[:A] ...
 #
 #    M  : DFT size (2 x samples per code period)
 #    Kc : Doppler bins per inference (spaced by fs / M)
@@ -23,6 +23,8 @@
 #         (default: L1CA,L5I,B1I,E5AI, e.g. E1B,E1C for 64000 at 8 MHz)
 #    -n : no compile (ONNX, quantization and emulator evaluation only)
 #    -q8: all layers 8-bit (no 16-bit tail)
+#    -sh: shared DFT model acq_M<M>_K<Kc>_R<R>_hs (inputs xr, xi: unitary DFT of
+#         the IF samples X [1][k2][1][k1], the bins by shifts of X)
 #    -ms: model script commands added, separated by ';'
 #
 #  The model (inputs xr, xi [1][n1][1][n2], IF samples wiped by the carrier of
@@ -45,7 +47,7 @@
 #  2026-10-11  1.0  new
 #  2026-10-11  1.1  add option -sig
 #  2026-10-13  1.2  add factorization A in M:Kc:R:A
-#  2026-10-14  1.3  add options -arch, -q8, -ms
+#  2026-10-14  1.3  add options -arch, -q8, -ms, -sh
 #
 import sys, os
 import numpy as np
@@ -58,7 +60,7 @@ from gen_rknn_acq import factorize
 SIGS = ['L1CA', 'L5I', 'B1I', 'E5AI'] # codes of calibration signals
 
 # build ONNX model --------------------------------------------------------------
-def build(A, B, Kc, R):
+def build(A, B, Kc, R, sh=False):
     M, W = A * B, Kc * A
     nodes, inits, cnt = [], [], [0]
     def nm(p):
@@ -78,17 +80,29 @@ def build(A, B, Kc, R):
     def cmul(ar, ai, br, bi):
         return (op('Sub', [op('Mul', [ar, br]), op('Mul', [ai, bi])]),
                 op('Add', [op('Mul', [ar, bi]), op('Mul', [ai, br])]))
+    def slc(x, axis, a, b):
+        i64 = lambda v: (inits.append(nh.from_array(np.array([v], dtype=np.int64), nm('s'))), inits[-1].name)[1]
+        return op('Slice', [x, i64(a), i64(b), i64(axis)])
+    def shift(u, i): # u [1][k2][1][k1] (X[A*k2+k1]) -> X[A*k2+k1+i]
+        if i == 0: return u
+        un = op('Concat', [slc(u, 1, 1, B), slc(u, 1, 0, 1)], axis=1)  # X[A*(k2+1)+k1]
+        return op('Concat', [slc(u, 3, i, A), slc(un, 3, 0, i)], axis=3)
+    xs = [1, B, 1, A] if sh else [1, A, 1, B]
     ins = [h.make_tensor_value_info(n, T.FLOAT, s) for n, s in
-        [('xr', [1, A, 1, B]), ('xi', [1, A, 1, B]), ('cr', [1, B, 1, A]), ('ci', [1, B, 1, A])]]
+        [('xr', xs), ('xi', xs), ('cr', [1, B, 1, A]), ('ci', [1, B, 1, A])]]
     k1 = np.arange(A)[None, :, None]; n2 = np.arange(B)[None, None, :]; kk = np.arange(Kc)[:, None, None]
     G = np.concatenate([dft(A, -1, (np.arange(A) + k) % A) for k in range(Kc)])
     t1 = np.exp(-2j * np.pi * (((k1 + kk) * n2) % M) / M).reshape(1, W, 1, B)
     t2 = np.exp(2j * np.pi * ((n2[0].T * k1[0].T) % M) / M)
-    yr, yi = cconv('xr', 'xi', G)                                     # [1][(k,k1)][1][n2]
-    yr, yi = cmul(yr, yi, const(t1.real), const(t1.imag))
     perm = [0, 3, 2, 1]
-    zr, zi = op('Transpose', [yr], perm=perm), op('Transpose', [yi], perm=perm)
-    ur, ui = cconv(zr, zi, dft(B, -1, range(B)))                      # [1][k2][1][(k,k1)]
+    if sh: # shared DFT: inputs X = DFT(x) [1][k2][1][k1], bins by shifts of X
+        ur = op('Concat', [shift('xr', i) for i in range(Kc)], axis=3) if Kc > 1 else 'xr'
+        ui = op('Concat', [shift('xi', i) for i in range(Kc)], axis=3) if Kc > 1 else 'xi'
+    else:
+        yr, yi = cconv('xr', 'xi', G)                                 # [1][(k,k1)][1][n2]
+        yr, yi = cmul(yr, yi, const(t1.real), const(t1.imag))
+        zr, zi = op('Transpose', [yr], perm=perm), op('Transpose', [yi], perm=perm)
+        ur, ui = cconv(zr, zi, dft(B, -1, range(B)))                  # [1][k2][1][(k,k1)]
     cr = op('Concat', ['cr'] * Kc, axis=3) if Kc > 1 else 'cr'
     ci = op('Concat', ['ci'] * Kc, axis=3) if Kc > 1 else 'ci'
     vr, vi = cmul(ur, ui, cr, ci)
@@ -108,12 +122,12 @@ def build(A, B, Kc, R):
     return m
 
 # check ONNX model by FFT -------------------------------------------------------
-def check(file, A, B, Kc, R):
+def check(file, A, B, Kc, R, sh=False):
     import onnxruntime as ort
     M = A * B; rng = np.random.default_rng(1); n = np.arange(M)
     x = (rng.standard_normal(M) + 1j * rng.standard_normal(M)) * np.exp(-2j * np.pi * 0.3141 * n)
     c = rng.standard_normal(M) + 1j * rng.standard_normal(M)
-    xs, cs = x.reshape(A, B)[None, :, None, :], c.reshape(B, A)[None, :, None, :]
+    xs, cs = xin(x, A, B, sh), c.reshape(B, A)[None, :, None, :]
     P = ort.InferenceSession(file).run(None, {k: v.astype(np.float32) for k, v in
         {'xr': xs.real, 'xi': xs.imag, 'cr': cs.real, 'ci': cs.imag}.items()})[0]
     P = P.astype(np.float64).reshape(Kc, R * B)
@@ -121,8 +135,13 @@ def check(file, A, B, Kc, R):
         / 64)[:R * B] for k in range(Kc)])
     return np.sqrt(np.mean((P - ref) ** 2) / np.mean(ref ** 2))
 
+# model input of IF samples x (shared DFT: unitary DFT of x) ---------------------
+def xin(x, A, B, sh):
+    if sh: return (np.fft.fft(x) / np.sqrt(len(x))).reshape(B, A)[None, :, None, :]
+    return x.reshape(A, B)[None, :, None, :]
+
 # synthetic signal inputs of a window -------------------------------------------
-def sig_input(rng, A, B, Kc, fs, cn0, sig, fd_bins=None):
+def sig_input(rng, A, B, Kc, fs, cn0, sig, fd_bins=None, sh=False):
     import sdr_code
     M, N = A * B, A * B // 2; T = N / fs
     code = sdr_code.gen_code(sig, int(rng.integers(1, 33)))
@@ -133,12 +152,12 @@ def sig_input(rng, A, B, Kc, fs, cn0, sig, fd_bins=None):
         amp * rc * np.exp(2j * np.pi * fd * np.arange(2 * N) / fs)
     x = x[:M] / np.sqrt(np.mean(np.abs(x[:M]) ** 2))
     c = sdr_code.gen_code_fft(code, T, 0.0, fs, N, N); c /= np.max(np.abs(c))
-    xs, cs = x.reshape(A, B)[None, :, None, :], c.reshape(B, A)[None, :, None, :]
+    xs, cs = xin(x, A, B, sh), c.reshape(B, A)[None, :, None, :]
     return [xs.real, xs.imag, cs.real, cs.imag], x, c
 
 # quantize, evaluate and compile by Dataflow Compiler ---------------------------
 def gen_hef(onnx_file, name, A, B, Kc, R, fs, out_dir, nocomp, arch='hailo10h',
-    q8=False, ms=''):
+    q8=False, ms='', sh=False):
     from hailo_sdk_client import ClientRunner, InferenceContext
     r = ClientRunner(hw_arch=arch)
     r.translate_onnx_model(onnx_file, name)
@@ -155,7 +174,7 @@ def gen_hef(onnx_file, name, A, B, Kc, R, fs, out_dir, nocomp, arch='hailo10h',
     cal = [[] for _ in range(4)]
     for i in range(64):
         d, _, _ = sig_input(rng, A, B, Kc, fs, rng.uniform(30, 58) if i % 4 else 0,
-            SIGS[(i // 4) % len(SIGS)])
+            SIGS[(i // 4) % len(SIGS)], sh=sh)
         for j in range(4): cal[j].append(nhwc(d[j])[0])
     r.load_model_script('model_optimization_flavor(optimization_level=0, compression_level=0)\n' +
         ('' if q8 else 'quantization_param([%s], precision_mode=a16_w16)\n' % ', '.join(tail)) +
@@ -168,7 +187,7 @@ def gen_hef(onnx_file, name, A, B, Kc, R, fs, out_dir, nocomp, arch='hailo10h',
             for cn0 in (36, 40, 45, 50, 55):
                 pk, dc, er, pr = 0, [], [], []
                 for _ in range(5):
-                    d, x, c = sig_input(rng, A, B, Kc, fs, cn0, sig, fd_bins=0.0)
+                    d, x, c = sig_input(rng, A, B, Kc, fs, cn0, sig, fd_bins=0.0, sh=sh)
                     ref = (np.abs(np.fft.ifft(np.fft.fft(x) * c)) ** 2 / 64)[:R * B]
                     q = np.asarray(r.infer(ctx, {ins[j]: nhwc(d[j]) for j in range(4)}))
                     q = np.transpose(q[0], (2, 0, 1)).reshape(Kc, -1)[0].astype(np.float64)
@@ -186,7 +205,7 @@ def gen_hef(onnx_file, name, A, B, Kc, R, fs, out_dir, nocomp, arch='hailo10h',
         print('%s: %d bytes' % (file, len(hef)))
 
 if __name__ == '__main__':
-    out_dir, arch, q8, ms = None, 'hailo10h', False, ''
+    out_dir, arch, q8, ms, sh = None, 'hailo10h', False, '', False
     fs, nocomp, shapes = 24e6, False, []
     i = 1
     while i < len(sys.argv):
@@ -196,6 +215,7 @@ if __name__ == '__main__':
         elif sys.argv[i] == '-sig': SIGS[:] = sys.argv[i + 1].split(','); i += 1
         elif sys.argv[i] == '-n': nocomp = True
         elif sys.argv[i] == '-q8': q8 = True
+        elif sys.argv[i] == '-sh': sh = True
         elif sys.argv[i] == '-ms': ms = sys.argv[i + 1]; i += 1
         else: shapes.append([int(v) for v in sys.argv[i].split(':')])
         i += 1
@@ -208,8 +228,8 @@ if __name__ == '__main__':
         A, B = (shape[3], M // shape[3]) if len(shape) > 3 else factorize(M)
         if A * B != M:
             print('invalid factorization %d = %d x %d' % (M, A, B)); continue
-        name = 'acq_M%d_K%d_R%d_h' % (M, Kc, R)
+        name = 'acq_M%d_K%d_R%d_h%s' % (M, Kc, R, 's' if sh else '')
         file = os.path.join(out_dir, name + '.onnx')
-        onnx.save(build(A, B, Kc, R), file)
-        print('%s: A=%d B=%d ONNX vs FFT NRMSE=%.2e' % (name, A, B, check(file, A, B, Kc, R)))
-        gen_hef(file, name, A, B, Kc, R, fs, out_dir, nocomp, arch, q8, ms)
+        onnx.save(build(A, B, Kc, R, sh), file)
+        print('%s: A=%d B=%d ONNX vs FFT NRMSE=%.2e' % (name, A, B, check(file, A, B, Kc, R, sh)))
+        gen_hef(file, name, A, B, Kc, R, fs, out_dir, nocomp, arch, q8, ms, sh)
