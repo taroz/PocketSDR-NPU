@@ -2056,3 +2056,60 @@ CPU), `cpu_opt` and FFTW `cpu` without wisdom on the same day:
 The Hailo-8 is 3.0-4.0x faster than `cpu_opt` (shared DFT on the CPU) and
 5.8-7.7x than FFTW `cpu`. Long codes with the decimation: all but L2CM (20 ms)
 on the Hailo-8 (B1CP/L1CD/B1CD share the model of L1CP, not verified).
+
+### 14.17 Fixed-set capacity of the Pi 5 with the Hailo-8
+
+The test of 14.13 (the same fixed sets, 142 background channels, settings and
+IF data) with the Hailo-8 HEF set of 14.16 (`hailo:hef=.../hailo8,batch=16`,
+L2CM 8 MHz by the fallback to `cpu_opt` in the plugin backend) and `cpu_opt`
+on the same day, alternated (2 runs per N, 3 for N = 175; script
+`pi_fix8.sh`, run directories `fx_<N>_h8_<r>`, `fx8_<N>_opt_<r>`):
+
+| N | backend | TRK max | TRK > 100% | locks 10/30/60/300 s | t90 / t95 (s) | losses |
+|---|---|---|---|---|---|---|
+| 140 | Hailo-8 | 8% / 8% | 0 / 0 s | **80** / 127 / 128 / 139 | 25-62\* / 66-69\* | 27 / 16 |
+| 140 | `cpu_opt` | 11% / 15% | 0 / 0 s | 52 / 103 / 138 / 139 | 44-45 / 51-52 | 13 / 10 |
+| 157 | Hailo-8 | 20% / 20% | 0 / 0 s | **77** / **140** / 151 / 154 | 30-32 / 35-107 | 13 / 10 |
+| 157 | `cpu_opt` | 24% / 21% | 0 / 0 s | 54 / 105 / 145 / 151 | 54-56 / 63-68 | 6 / 11 |
+| 175 | Hailo-8 | 102% / 101% / 54% | 4 / 2 / 0 s | **79** / **142** / **166** / 169 | 38-44 / 47-49 (-) | 167 / 24 / 22 |
+| 175 | `cpu_opt` | 93% / 61% / 57% | 0 / 0 / 0 s | 56 / 110 / 151 / 172 | 68-70 / 82-89 | 260 / 35 / 1 |
+| 200 | Hailo-8 | 104% / 104% | 7 / 11 s | 76 / 150 / 177 / 183 | 72-134 / - | 363 / 146 |
+| 200 | `cpu_opt` | 137% / 107% | 9 / 6 s | 60 / 110 / 160 / 185 | 108-130 / - | 276 / 77 |
+
+(locks: mean of the runs; CPU 92-103% per core in all runs.)
+
+- **Initial acquisition**: the Hailo-8 locks 76-80 of the fixed set by 10 s
+  (Hailo-10H of 14.13: 61-66, `cpu_opt` 52-60) and 127-150 by 30 s (vs
+  103-110), the time to 90% of the set 1.7-1.8x shorter than `cpu_opt` at
+  N = 157-175, as
+  the Hailo-10H.
+- **Real-time limit**: as the Hailo-10H (~175). At N = 175 two of the three
+  runs of the Hailo-8 overflow briefly (2-4 s, lagging episodes from 245 s and
+  288 s, the TRK buffer rising slowly) and one does not (54%); `cpu_opt` has
+  no overflow in the three runs this time (126% in one run of 14.13). The
+  mean TRK buffer at N = 175 is 17-21% for the Hailo-8, 16-18% for the
+  Hailo-10H (14.13) and 3-13% for `cpu_opt`: the Hailo-8 plugin uses more CPU
+  per second of search than the Hailo-10H (exec 29% of the plugin time vs 76%,
+  the host prepares the shared DFT inputs and accumulates the outputs; 1.4
+  cores while searching L1CA 24 MHz in `bench_sdr_acq`) although less per
+  search than `cpu_opt` (103 vs 274 ms CPU per signal). The difference of the
+  limit between the backends is within the run-to-run variation near N = 175.
+- \*N = 140: L2CM (T = 20 ms > `MAX_ACQ`) is only searched by the assisted
+  acquisition after a lock >= 2 s (`MIN_LOCK`) of another signal of the same
+  satellite. With the Hailo-8 the first round of the search reaches the L2CM
+  channels at ~2.5 s, before L1CA (locked at ~1.3 s) has locked for 2 s, so
+  they are skipped and searched only in the next round (~60-70 s): t90 / t95
+  of N = 140 are longer by it. At N >= 157 the L2CM channels lock at 5-8 s
+  (median) as with the other backends. An effect of the scheduling of the
+  receiver (a faster search reaches the channels earlier), not of the NPU.
+- Never locked in some Hailo-8 runs: QZS J05 (L1CA 195, then L2CM / L1CP of
+  J05 by the assist) at ~34 dB-Hz near the threshold, not found in the first
+  search at 1.25 s (33.4-33.9 dB-Hz) and searched again only after 145-175 s
+  or not at all. The detection of the Hailo-8 models is the same as the CPU
+  (L1CA 8 MHz, 12 PRNs incl. 195 at 4 times: C/N0 within 0.2 dB of
+  `cpu_opt`); the miss is the sampling of the C/N0 by the earlier search
+  window.
+
+The Hailo-8 (26 TOPS, single context models) gives the same capacity and
+the same faster initial acquisition as the Hailo-10H on the Pi 5; the limit
+of ~175 fixed signals is set by the CPU (tracking) for all backends.
