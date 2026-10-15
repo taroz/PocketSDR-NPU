@@ -91,6 +91,8 @@
 //                   of the fewest chunks (Kc up to 21)
 //  2026-10-14  1.5  model selected from the HEFs in hef_dir (any Kc, any
 //                   factorization A x B), Hailo-8 (HailoRT 4.24)
+//  2026-10-14  1.6  shared DFT models (_hs, X by FFTW), code offset 0
+//                   replaced by the neighbors (bias of the quantization)
 //
 #include <stdio.h>
 #include <stdlib.h>
