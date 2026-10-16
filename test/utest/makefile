@@ -116,34 +116,34 @@ STUB_RCV  = $(TEST_SRC)/sdr_rcv_stub.c
 
 SRC_test_sdr_array    = $(SRC)/sdr_array.c $(SRC)/sdr_cmn.c
 SRC_test_sdr_ch       = $(SRC)/sdr_ch.c $(SRC)/sdr_nav.c $(SRC)/sdr_code.c \
-                        $(SRC)/sdr_code_gal.c $(SRC)/sdr_func.c \
+                        $(SRC)/sdr_code_gal.c $(SRC)/sdr_func.c $(SRC)/sdr_acc.c \
                         $(SRC)/sdr_fec.c $(SRC)/sdr_ldpc.c \
                         $(SRC)/sdr_nb_ldpc.c $(SRC)/sdr_cmn.c
 SRC_test_sdr_cmn      = $(SRC)/sdr_cmn.c
 SRC_test_sdr_code     = $(SRC)/sdr_code.c $(SRC)/sdr_code_gal.c \
-                        $(SRC)/sdr_func.c $(SRC)/sdr_cmn.c
+                        $(SRC)/sdr_func.c $(SRC)/sdr_acc.c $(SRC)/sdr_cmn.c
 SRC_test_sdr_code_gal = $(SRC)/sdr_code_gal.c
 SRC_test_sdr_conf     = $(SRC)/sdr_conf.c $(STUB_USB) $(SRC)/sdr_cmn.c
 SRC_test_sdr_dev      = $(STUB_DEV) $(SRC)/sdr_cmn.c
 SRC_test_sdr_fec      = $(SRC)/sdr_fec.c $(SRC)/sdr_cmn.c
-SRC_test_sdr_func     = $(SRC)/sdr_func.c $(SRC)/sdr_cmn.c
+SRC_test_sdr_func     = $(SRC)/sdr_func.c $(SRC)/sdr_acc.c $(SRC)/sdr_cmn.c
 SRC_test_sdr_ldpc     = $(SRC)/sdr_ldpc.c $(SRC)/sdr_nb_ldpc.c \
                         $(SRC)/sdr_cmn.c
 SRC_test_sdr_nav      = $(SRC)/sdr_nav.c $(SRC)/sdr_fec.c \
                         $(SRC)/sdr_ldpc.c $(SRC)/sdr_nb_ldpc.c \
                         $(SRC)/sdr_code.c $(SRC)/sdr_code_gal.c \
-                        $(SRC)/sdr_func.c $(SRC)/sdr_cmn.c
+                        $(SRC)/sdr_func.c $(SRC)/sdr_acc.c $(SRC)/sdr_cmn.c
 SRC_test_sdr_nb_ldpc  = $(SRC)/sdr_nb_ldpc.c $(SRC)/sdr_cmn.c
-SRC_test_sdr_pvt      = $(SRC)/sdr_pvt.c $(SRC)/sdr_func.c \
+SRC_test_sdr_pvt      = $(SRC)/sdr_pvt.c $(SRC)/sdr_func.c $(SRC)/sdr_acc.c \
                         $(STUB_RCV) $(SRC)/sdr_cmn.c
-SRC_test_sdr_perf     = $(SRC)/sdr_func.c $(SRC)/sdr_code.c \
+SRC_test_sdr_perf     = $(SRC)/sdr_func.c $(SRC)/sdr_acc.c $(SRC)/sdr_code.c \
                         $(SRC)/sdr_code_gal.c $(SRC)/sdr_array.c \
                         $(SRC)/sdr_ch.c $(SRC)/sdr_nav.c $(SRC)/sdr_fec.c \
                         $(SRC)/sdr_ldpc.c $(SRC)/sdr_nb_ldpc.c \
                         $(SRC)/sdr_cmn.c
 SRC_test_sdr_rcv      = $(SRC)/sdr_rcv.c $(SRC)/sdr_ch.c $(SRC)/sdr_nav.c \
                         $(SRC)/sdr_code.c $(SRC)/sdr_code_gal.c \
-                        $(SRC)/sdr_func.c $(SRC)/sdr_array.c \
+                        $(SRC)/sdr_func.c $(SRC)/sdr_acc.c $(SRC)/sdr_array.c \
                         $(SRC)/sdr_pvt.c $(SRC)/sdr_conf.c \
                         $(SRC)/sdr_fec.c $(SRC)/sdr_ldpc.c \
                         $(SRC)/sdr_nb_ldpc.c $(STUB_DEV) $(STUB_SDEV) \
@@ -152,7 +152,7 @@ SRC_test_sdr_sdev     = $(STUB_SDEV) $(SRC)/sdr_cmn.c
 SRC_test_sdr_usb      = $(STUB_USB) $(SRC)/sdr_cmn.c
 SRC_test_sdr_web      = $(SRC)/sdr_web.c $(SRC)/sdr_rcv.c $(SRC)/sdr_ch.c \
                         $(SRC)/sdr_nav.c $(SRC)/sdr_code.c \
-                        $(SRC)/sdr_code_gal.c $(SRC)/sdr_func.c \
+                        $(SRC)/sdr_code_gal.c $(SRC)/sdr_func.c $(SRC)/sdr_acc.c \
                         $(SRC)/sdr_array.c $(SRC)/sdr_pvt.c \
                         $(SRC)/sdr_conf.c $(SRC)/sdr_fec.c \
                         $(SRC)/sdr_ldpc.c $(SRC)/sdr_nb_ldpc.c \

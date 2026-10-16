@@ -38,6 +38,8 @@
 //  2026-07-19  1.25 add pre-combined E5ABQ replicas (a+b, a-b) to correlate
 //                   both sidebands in one pass once the polarity is calibrated
 //  2026-07-19  1.26 improve low-C/N0 acquisition and pilot tracking
+//  2026-10-16  1.27 search code offsets < N only and all windows of an
+//                   acquisition at once by accelerator backend
 //
 #include <ctype.h>
 #include <math.h>
@@ -305,6 +307,7 @@ static sdr_acq_t *acq_new(const char *sig, int prn, const int8_t *code,
     acq->fds = sdr_dop_bins(T, 0.0f, (float)sdr_max_dop, &acq->len_fds);
     acq->P_sum = NULL;
     acq->n_sum = 0;
+    acq->ix_sum = NULL;
     return acq;
 }
 
@@ -315,6 +318,7 @@ static void acq_free(sdr_acq_t *acq)
     sdr_cpx_free(acq->code_fft);
     sdr_free(acq->fds);
     sdr_free(acq->P_sum);
+    sdr_free(acq->ix_sum);
     sdr_free(acq);
 }
 
@@ -555,18 +559,36 @@ static void search_sig(sdr_ch_t *ch, double time, const sdr_buff_t *buff,
         fds = fd_ext_bins;
         n = nw;
     }
+    double t_acq = assisted ? sdr_t_acq_ext : sdr_t_acq;
+    
     if (!ch->acq->P_sum || ch->acq->n_sum == 0) {
         sdr_free(ch->acq->P_sum);
         ch->acq->P_sum = (float *)sdr_malloc(sizeof(float) * 2 * ch->N * n);
+        sdr_free(ch->acq->ix_sum);
+        ch->acq->ix_sum = sdr_acc_search_multi() ? (int *)sdr_malloc(
+            sizeof(int) * ((int)(t_acq / ch->T) + 2)) : NULL;
     }
-    // parallel code search and non-coherent integration
-    sdr_search_code(ch->acq->code_fft, ch->T, buff, ix, 2 * ch->N, ch->fs,
-        ch->fi, fds, n, ch->acq->P_sum);
+    if (ch->acq->ix_sum) { // defer search to multi-window search
+        ch->acq->ix_sum[ch->acq->n_sum] = ix;
+    } else { // parallel code search and non-coherent integration
+        sdr_search_code2(ch->acq->code_fft, ch->T, buff, ix, 2 * ch->N, ch->N,
+            ch->fs, ch->fi, fds, n, ch->acq->P_sum);
+    }
     ch->acq->n_sum++;
     
-    double t_acq = assisted ? sdr_t_acq_ext : sdr_t_acq;
     if (ch->acq->n_sum * ch->T >= t_acq) {
         int idx[2];
+        
+        // multi-window search (each window by sdr_search_code2() if failed)
+        if (ch->acq->ix_sum && !sdr_acc_search_code_multi(ch->acq->code_fft,
+            ch->T, buff, ch->acq->ix_sum, ch->acq->n_sum, 2 * ch->N, ch->N,
+            ch->fs, ch->fi, fds, n, ch->acq->P_sum)) {
+            for (int i = 0; i < ch->acq->n_sum; i++) {
+                sdr_search_code2(ch->acq->code_fft, ch->T, buff,
+                    ch->acq->ix_sum[i], 2 * ch->N, ch->N, ch->fs, ch->fi, fds,
+                    n, ch->acq->P_sum);
+            }
+        }
         
         // search max correlation power
         float cn0 = sdr_corr_max(ch->acq->P_sum, 2 * ch->N, ch->N, n, ch->T,
@@ -591,7 +613,9 @@ static void search_sig(sdr_ch_t *ch, double time, const sdr_buff_t *buff,
                 ch->prn, cn0);
         }
         sdr_free(ch->acq->P_sum);
+        sdr_free(ch->acq->ix_sum);
         ch->acq->P_sum = NULL;
+        ch->acq->ix_sum = NULL;
         ch->acq->n_sum = 0;
         ch->acq->fd_ext = 0.0;
         ch->acq->fd_ext_valid = 0;

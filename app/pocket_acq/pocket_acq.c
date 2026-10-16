@@ -9,6 +9,7 @@
 //  2022-08-08  1.1  add option -w, modify option -d
 //  2024-07-02  1.2  support tag file input for auto-configuration
 //  2026-06-01  1.3  support CS8 and CS16 formats
+//  2026-10-16  1.4  add -acc option for accelerator backend
 //
 #include "pocket_sdr.h"
 
@@ -33,7 +34,7 @@ static void show_usage(void)
 {
     printf("Usage: pocket_acq [-sig sig] [-prn prn[,...]] [-tint tint]\n");
     printf("       [-toff toff] [-fmt fmt] [-f freq] [-fi freq] [-d freq[,freq]]\n");
-    printf("       [-nz] file\n");
+    printf("       [-nz] [-acc backend] file\n");
     exit(0);
 }
 
@@ -194,7 +195,7 @@ int search_sig(const char *sig, int prn, const sdr_buff_t *buff, double fs,
 // main (see doc/command_ref.md) -----------------------------------------------
 int main(int argc, char **argv)
 {
-    const char *sig = "L1CA", *file = "", *fftw_wisdom = FFTW_WISDOM;
+    const char *sig = "L1CA", *file = "", *fftw_wisdom = FFTW_WISDOM, *acc = "cpu";
     double fs = 12e6, fi = 0.0, T = T_AQC, toff = 0.0, ref_dop = 0.0;
     double max_dop = 5000.0;
     int prns[SDR_MAX_NPRN], nprn = 0, opt[5] = {0}, fmt = SDR_FMT_INT8X2, IQ = 2;
@@ -233,6 +234,8 @@ int main(int argc, char **argv)
             sscanf(argv[++i], "%lf,%lf", &ref_dop, &max_dop);
         } else if (!strcmp(argv[i], "-nz")) {
             opt[2] = 1;
+        } else if (!strcmp(argv[i], "-acc") && i + 1 < argc) {
+            acc = argv[++i];
         } else if (!strcmp(argv[i], "-v")) {
             print_ver();
         } else if (argv[i][0] == '-') {
@@ -256,6 +259,10 @@ int main(int argc, char **argv)
         T = Tcode;
     }
     sdr_func_init(fftw_wisdom);
+    if (!sdr_acc_init(acc)) {
+        fprintf(stderr, "accelerator backend error: %s\n", acc);
+        exit(-1);
+    }
     
     // read tag file
     double fo[SDR_MAX_RFCH];
@@ -291,5 +298,6 @@ int main(int argc, char **argv)
         fflush(stdout);
     }
     printf("TIME = %.3f s\n", (sdr_get_tick() - tick) * 1e-3);
+    sdr_acc_exit();
     return 0;
 }

@@ -27,6 +27,7 @@
 //  2026-08-01  1.19 add Web UI server APIs (sdr_web.c)
 //  2026-08-02  1.20 add Web UI receiver configuration and lifecycle APIs
 //  2026-10-16  1.21 add API sdr_thread_affinity(), decimator APIs
+//                   add acquisition accelerator APIs (sdr_acc.c)
 //
 #ifndef POCKET_SDR_H
 #define POCKET_SDR_H
@@ -115,6 +116,8 @@ extern "C" {
 
 #define SDR_FFT_FORWARD 0       // SDR FFT direction forward
 #define SDR_FFT_BACKWARD 1      // SDR FFT direction backward
+#define SDR_ACC_CPU    0        // accelerator backend: CPU
+#define SDR_ACC_PLUGIN 1        // accelerator backend: plugin (NPU etc.)
 
 #define SDR_CALIB_BOTH 0        // calib mode: estimate rpy + bias
 #define SDR_CALIB_BIAS 1        // calib mode: estimate bias only (rpy=0 fixed)
@@ -184,6 +187,8 @@ typedef struct {                // signal acquisition type
     int fd_ext_n;               // number of Doppler bins for fd_ext (0=3)
     float *P_sum;               // sum of correlation powers
     int n_sum;                  // number of sum
+    int *ix_sum;                // buffer indices of deferred windows [n_sum]
+                                // (multi-window search by accelerator)
 } sdr_acq_t;
 
 typedef struct {                // signal tracking type
@@ -273,6 +278,15 @@ typedef struct {                // IF data buffer type
     sdr_cpx8_t *data;           // IF data
     int IQ, N;                  // sampling types (1:I,2:IQ) and buffer size
 } sdr_buff_t;
+
+typedef struct {                // accelerator backend statistics type
+    int64_t ncall;              // number of accelerated calls
+    int64_t nfall;              // number of CPU fallback calls
+    double t_total;             // total time of accelerated calls (s)
+    double t_conv;              // IF data to tensor conversion time (s)
+    double t_in, t_exec, t_out; // backend input/execution/output time (s)
+    double bytes_in, bytes_out; // backend input/output tensor bytes
+} sdr_acc_stat_t;
 
 typedef struct {                // SDR IF data statistics
     double std;                 // IF data std-dev
@@ -488,6 +502,9 @@ int sdr_tag_read(const char *file, char *prog, gtime_t *time, int *fmt,
 void sdr_search_code(const sdr_cpx_t *code_fft, double T,
     const sdr_buff_t *buff, int ix, int N, double fs, double fi,
     const float *fds, int len_fds, float *P);
+void sdr_search_code2(const sdr_cpx_t *code_fft, double T,
+    const sdr_buff_t *buff, int ix, int N, int Nmax, double fs, double fi,
+    const float *fds, int len_fds, float *P);
 float sdr_corr_max(const float *P, int N, int Nmax, int M, double T, int *ix);
 double sdr_fine_dop(const float *P, int N, const float *fds, int len_fds,
     const int *ix);
@@ -543,6 +560,19 @@ sdr_dec_t *sdr_dec_new(int D, int ntap, double fc, double foff, double fs);
 int sdr_dec_delay(const sdr_dec_t *dec);
 void sdr_dec_free(sdr_dec_t *dec);
 void sdr_dec_apply(sdr_dec_t *dec, const sdr_cpx8_t *in, int N, sdr_cpx8_t *out);
+
+// sdr_acc.c
+int sdr_acc_init(const char *backend);
+void sdr_acc_exit(void);
+int sdr_acc_type(const char **name);
+void sdr_acc_stat(sdr_acc_stat_t *stat, int reset);
+int sdr_acc_search_code(const sdr_cpx_t *code_fft, double T,
+    const sdr_buff_t *buff, int ix, int N, int Nmax, double fs, double fi,
+    const float *fds, int len_fds, float *P);
+int sdr_acc_search_multi(void);
+int sdr_acc_search_code_multi(const sdr_cpx_t *code_fft, double T,
+    const sdr_buff_t *buff, const int *ix, int NW, int N, int Nmax, double fs,
+    double fi, const float *fds, int len_fds, float *P);
 
 // sdr_code.c
 int8_t *sdr_gen_code(const char *sig, int prn, int *N);

@@ -69,6 +69,7 @@
 //                   in mix_carr_p() (-DMIX_LUT_SCALAR: LUT of 256 phases)
 //                   add API sdr_dec_new(), sdr_dec_free(), sdr_dec_apply(),
 //                   sdr_dec_delay()
+//                   add API sdr_search_code2() (accelerator backend)
 //
 #include <math.h>
 #include <stdarg.h>
@@ -1039,7 +1040,18 @@ void sdr_search_code(const sdr_cpx_t *code_fft, double T,
     const sdr_buff_t *buff, int ix, int N, double fs, double fi,
     const float *fds, int len_fds, float *P)
 {
-    if (search_code_dft(code_fft, buff, ix, N, fs, fi, fds, len_fds, P)) {
+    sdr_search_code2(code_fft, T, buff, ix, N, N, fs, fi, fds, len_fds, P);
+}
+
+// parallel code search for code offsets < Nmax by accelerator backend or CPU
+// (P[i*N+j] (j >= Nmax) may not be updated) -----------------------------------
+void sdr_search_code2(const sdr_cpx_t *code_fft, double T,
+    const sdr_buff_t *buff, int ix, int N, int Nmax, double fs, double fi,
+    const float *fds, int len_fds, float *P)
+{
+    if (sdr_acc_search_code(code_fft, T, buff, ix, N, Nmax, fs, fi, fds,
+        len_fds, P) ||
+        search_code_dft(code_fft, buff, ix, N, fs, fi, fds, len_fds, P)) {
         return;
     }
     sdr_cpx_t *C = sdr_cpx_malloc(N);

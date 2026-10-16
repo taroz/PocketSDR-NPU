@@ -30,6 +30,7 @@
 //  2026-08-07  1.13 close the SDR device on console close for Windows
 //  2026-10-16  1.14 add -cpu_acq, -cpu_trk, -rcv_prio, -trk_guard and -dec
 //                   options
+//                   add -acc option for acquisition accelerator backend
 //
 #include <math.h>
 #include <signal.h>
@@ -58,7 +59,7 @@ static const char *usage_text[] = {
     "       [-toff toff] [-ti tint] [-p bus,[,port] [-c conf_file]",
     "       [-driver name] [-gain gain] [-bw bw] [-fd dopp]",
     "       [-log path] [-nmea path] [-rtcm path] [-raw path] ... [-opt file]",
-    "       [-arch nch] [-geom file] [-cpu_acq cpus] [-cpu_trk cpus]",
+    "       [-arch nch] [-geom file] [-acc backend] [-cpu_acq cpus] [-cpu_trk cpus]",
     "       [-rcv_prio prio] [-trk_guard pct] [-dec rfch:D[:foff][,...]] [file]",
     NULL
 };
@@ -195,6 +196,18 @@ static int print_rcv_stat(sdr_rcv_t *rcv, int nrow, int max_row)
     return n;
 }
 
+// print accelerator backend statistics ----------------------------------------
+static void print_acc_stat(void)
+{
+    sdr_acc_stat_t st;
+    const char *name;
+    if (sdr_acc_type(&name) == SDR_ACC_CPU) return;
+    sdr_acc_stat(&st, 0);
+    fprintf(stderr, "ACC(%s): calls=%lld fallback=%lld time=%.3f s "
+        "(exec=%.3f s)\n", name, (long long)st.ncall, (long long)st.nfall,
+        st.t_total, st.t_exec);
+}
+
 // main ------------------------------------------------------------------------
 // Command spec: see doc/command_ref.md.
 int main(int argc, char **argv)
@@ -217,7 +230,7 @@ int main(int argc, char **argv)
     double gain = 0.0, bw = 0.0, max_dop = 0.0;
     char rfch_opt[1024] = "-RFCH";
     const char *geom_file = "";
-    const char *cpu_acq = "", *cpu_trk = "", *dec = "";
+    const char *acc = "cpu", *cpu_acq = "", *cpu_trk = "", *dec = "";
     int rcv_prio = 0, trk_guard = 0;
 
     for (int i = 1; i < argc; i++) {
@@ -298,6 +311,8 @@ int main(int argc, char **argv)
                 atoi(argv[++i]));
         } else if (!strcmp(argv[i], "-geom") && i + 1 < argc) {
             geom_file = argv[++i];
+        } else if (!strcmp(argv[i], "-acc") && i + 1 < argc) {
+            acc = argv[++i];
         } else if (!strcmp(argv[i], "-cpu_acq") && i + 1 < argc) {
             cpu_acq = argv[++i];
         } else if (!strcmp(argv[i], "-cpu_trk") && i + 1 < argc) {
@@ -327,11 +342,19 @@ int main(int argc, char **argv)
         sdr_rcv_setopt("max_dop", max_dop);
     }
     sdr_func_init(fftw_wisdom);
-    if (*cpu_acq || *cpu_trk) { // (threads inherit the CPU affinity)
-        if (!sdr_thread_affinity(*cpu_trk ? cpu_trk : SDR_CPU_ALL)) {
-            fprintf(stderr, "CPU affinity error: %s\n", cpu_trk);
-            return -1;
-        }
+    // the threads of the backend inherit the CPU affinity of the caller
+    if (*cpu_acq && !sdr_thread_affinity(cpu_acq)) {
+        fprintf(stderr, "CPU affinity error: %s\n", cpu_acq);
+        return -1;
+    }
+    if (!sdr_acc_init(acc)) {
+        fprintf(stderr, "accelerator backend error: %s\n", acc);
+        return -1;
+    }
+    if ((*cpu_acq || *cpu_trk) &&
+        !sdr_thread_affinity(*cpu_trk ? cpu_trk : SDR_CPU_ALL)) {
+        fprintf(stderr, "CPU affinity error: %s\n", cpu_trk);
+        return -1;
     }
     size_t len = strlen(rfch_opt);
     snprintf(rfch_opt + len, sizeof(rfch_opt) - len, "%s%s%s%s",
@@ -395,6 +418,8 @@ int main(int argc, char **argv)
         printf("%s", ESC_VCUR);
     }
     sdr_rcv_close(rcv);
+    print_acc_stat();
+    sdr_acc_exit();
     
     if (*debug_file) {
         traceclose();
