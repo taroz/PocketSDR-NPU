@@ -9,6 +9,8 @@
 #        the fixed set (s)
 #  loss: gaps > 2 s of the channel log of the fixed channels
 #  CPU : mean CPU usage per core 30-300 s (mon.txt)
+#  -cpu: CPU usage per core 0-60 s and 60-300 s, CPU time of pocket_trk (user +
+#        sys, s) (time.txt), instead of the losses
 #
 #  usage: cap_sum.py dir ...
 #
@@ -36,15 +38,22 @@ def summary(d):
     cpu = []
     for l in open(d + '/mon.txt'):
         f = l.split('|')
-        if len(f) > 1 and 30 <= int(f[0]) <= TEND:
+        if len(f) > 1 and int(f[0]) <= TEND:
             v = [int(x) for x in f[1].split()[1:]]
-            cpu.append(sum(v) / len(v))
+            cpu.append((int(f[0]), sum(v) / len(v)))
+    mean = lambda a, b: (lambda v: sum(v) / max(len(v), 1))([c for t, c in cpu if a <= t <= b])
     trk = trk or [float('nan')]
-    print('%-20s TRK %5.1f %4.1f %3d s | lock %3d %3d %3d %3d /%d t90 %5.1f t95 %5.1f | '
-        'loss %3d | CPU %3.0f%%' % (d, max(trk), sum(trk) / len(trk),
-        sum(x > 100 for x in trk), at(10), at(30), at(60), at(TEND), N, tq(0.9),
-        tq(0.95), loss, sum(cpu) / max(len(cpu), 1)))
+    head = '%-24s TRK %5.1f %4.1f %3d s | lock %3d %3d %3d %3d /%d t90 %5.1f t95 %5.1f | ' % (
+        d, max(trk), sum(trk) / len(trk), sum(x > 100 for x in trk), at(10), at(30), at(60),
+        at(TEND), N, tq(0.9), tq(0.95))
+    if '-cpu' in sys.argv:
+        tm = {k: v for k, v in re.findall(r'(user|sys)\s+(\S+)', open(d + '/time.txt').read())}
+        sec = lambda v: float(v.split('m')[0]) * 60 + float(v.split('m')[1].rstrip('s'))
+        print(head + 'CPU 0-60 %3.0f%% 60-300 %3.0f%% time %6.1f s' % (mean(0, 60),
+            mean(60, TEND), sec(tm['user']) + sec(tm['sys'])))
+    else:
+        print(head + 'loss %3d | CPU %3.0f%%' % (loss, mean(30, TEND)))
 
 if __name__ == '__main__':
     for d in sys.argv[1:]:
-        summary(d)
+        if d != '-cpu': summary(d)

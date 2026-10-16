@@ -11,7 +11,8 @@
 #
 #  environment: INPUT (300 s IF data), TRK, OUT, CAP_OPTS (other options, e.g.
 #  "-opt fftw.conf" with FFTW wisdom), CAP_OPTS_A, CAP_OPTS_B (options of
-#  backend_a or b only, e.g. "-cpu_acq 0-3 -cpu_trk 4-7") (see e2e.sh), the
+#  backend_a or b only, e.g. "-cpu_acq 0-3 -cpu_trk 4-7"), SETSFX (suffix of
+#  the signal file, e.g. _nobg: fix_<N>_nobg.sh) (see e2e.sh), the
 #  results summarized by cap_sum.py OUT/fx_*
 #
 #  -rcv_prio needs CAP_SYS_NICE (e.g. sudo setcap cap_sys_nice+ep pocket_trk).
@@ -21,7 +22,7 @@ export TLIM=${TLIM:-305}
 DEC="1:3:7.42,1:3:-6.902,2:3 -LOG_LEVEL=4" # (log level 4: buffer usage)
 tag() { echo "$1" | cut -d: -f1; }
 run() {
-    SIGFILE=$EVAL/fix_$2.sh $EVAL/e2e.sh fx_$2_$(tag $3)_$1 -acc $3 -rcv_prio 10 \
+    SIGFILE=$EVAL/fix_$2$SETSFX.sh $EVAL/e2e.sh fx_$2${SETSFX}_$(tag $3)_$1 -acc $3 -rcv_prio 10 \
         -trk_guard 20 -dec "$DEC" $CAP_OPTS $4
     sleep 30
 }

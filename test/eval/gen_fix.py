@@ -4,7 +4,8 @@
 # reference runs), nested sets (S_N1 in S_N2 for N1 < N2), N > |S| by
 # duplicating the signals in the same order, + background search channels
 # (signals never found, the same as gen_cap.py)
-# usage: gen_fix.py reliable.txt found_all.txt N out.sh
+# usage: gen_fix.py reliable.txt found_all.txt N out.sh [-nobg]
+# (-nobg: no background search channels)
 # (fix_<N>.sh: gen_fix.py reliable24.txt found24.txt N fix_<N>.sh, reliable24:
 # the signals tracked to the end of the 24 MHz reference runs, found24: the
 # signals of the background list ever found)
@@ -30,6 +31,7 @@ def opts(pairs):
     for s, p in pairs: g.setdefault(s, []).append(p)
     return ' '.join('-sig %s -prn %s -rfch %d' % (s, ','.join(v), RFCH[s]) for s, v in g.items())
 bg = [(s, str(p)) for s, r in BG for p in r if (s, str(p)) not in found]
+if '-nobg' in sys.argv[5:]: bg = []
 with open(sys.argv[4], 'w') as f:
     f.write('FO=1568,1227.6,1176.45,1207.14\n')
     f.write('SIGS="%s %s"\n' % (opts(sel), opts(bg)))
