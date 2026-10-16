@@ -1,3 +1,71 @@
+# **PocketSDR-NPU - GNSS Signal Acquisition on NPUs of Single-Board Computers**
+
+This repository is a fork of [**Pocket SDR**](https://github.com/tomojitakasu/PocketSDR)
+(T. Takasu) that runs the parallel code search of the signal acquisition on the
+NPU of low-power single-board computers (SBCs). The receiver (tracking,
+navigation data, PVT) is the original Pocket SDR. The original README follows
+the NPU section.
+
+### **Results** (preliminary, to be updated)
+
+Acquisition time per signal (ms, all PRNs, non-coherent integration of T_ACQ),
+24 MHz IF data of Pocket SDR FE 4CH (`pocket_L1L2L5E5b_24MHz.conf`), the
+narrowband signals decimated to 8 MHz:
+
+| signal | CPU, Pi 5 | Hailo-8, Pi 5 | Hailo-10H, Pi 5 | CPU, RK3588 (A76) | RKNN INT8, RK3588 |
+|---|---|---|---|---|---|
+| L1CA 8 MHz (1 ms) | 69 | 22.6 | 66 | 51 | 47 |
+| E1B 8 MHz (4 ms) | 323 | 87 | 156 | 294 | 169 |
+| L5I 24 MHz (1 ms) | 274 | 74 | 151 | 204 | 125 |
+| L1CP 8 MHz (10 ms, direct) | 1229 | 410 | 730 | 891 | 519 |
+| L2CM 8 MHz (20 ms, direct) | 3525 | - | 1162 | 2620 | 1243 |
+
+- CPU: the parallel code search with the DFT of the IF samples shared by the
+  Doppler bins (`sdr_search_code()`, FFTW), Pi 5: 4 cores, RK3588: 1 core.
+- The NPU also reduces the CPU time of the acquisition to 1/2-1/5, which is
+  used for the tracking: on the Pi 5 with Hailo, the receiver locks ~95% of a
+  fixed set of 140-175 signals by 30 s (CPU: ~70%) and tracks ~175 signals in
+  real time.
+
+### **Supported NPUs**
+
+| NPU | plugin | runtime | models |
+|---|---|---|---|
+| Hailo-8 (Raspberry Pi AI HAT+), Hailo-10H (AI HAT+ 2) | `libsdr_acc_hailo.so` | HailoRT 4.x (Hailo-8), 5.x (Hailo-10H) | HEF by `lib/build/gen_hailo_acq.py` (Hailo Dataflow Compiler) |
+| Rockchip RK3588 NPU | `libsdr_acc_rknn.so` | RKNN runtime 2.3 | INT8 RKNN model by `lib/build/gen_rknn_acq.py` (RKNN-Toolkit2) |
+
+The models depend on the NPU, the runtime version and the sampling rate. The
+models for the 24 MHz configuration are in the release assets (place them in
+`lib/linux/hailo`, `lib/linux/hailo8` or `lib/linux/rknn`).
+
+### **Build and Usage**
+
+```
+cd lib/build
+make USE_SOAPY=0 USE_FFTW=1 USE_HAILO=1 && make USE_SOAPY=0 USE_FFTW=1 USE_HAILO=1 install   # or USE_RKNN=1
+cd ../../app/pocket_trk && make USE_SOAPY=0 USE_FFTW=1
+
+pocket_trk -acc hailo:hef=../../lib/linux/hailo8,batch=16 -dec 1:3:7.42,1:3:-6.902,2:3 \
+    -trk_guard 20 -rcv_prio 10 [-sig ... -prn ... -rfch ...] file
+pocket_trk -acc rknn -dec 1:3:7.42,1:3:-6.902,2:3 -cpu_acq 0-3 -cpu_trk 4-7 ...
+```
+
+- `-acc backend`: acquisition backend (`cpu`, `hailo[:hef=dir,batch=n]`,
+  `rknn[:cores=n,model=dir]`). Shapes without a model are searched by the CPU.
+- `-dec rfch:D[:foff]`: decimated sub-bands (e.g. 24 MHz to 8 MHz for the
+  narrowband signals of the L1 band and L2C).
+- `-cpu_acq`, `-cpu_trk`, `-rcv_prio`, `-trk_guard`: CPU assignment and
+  real-time options for SBCs. See [doc/command_ref.md](doc/command_ref.md).
+
+Evaluation: `test/eval` (acquisition benchmark `acq_bench.sh`, fixed-set
+capacity `fixed_cap.sh`), tests: `test/utest` (`bench_sdr_acq`,
+`bench_sdr_trk`, `test_sdr_acc`).
+
+Branches: `main` (this version), `dev` (development history with the other
+evaluated methods).
+
+---
+
 
 # **Pocket SDR - An Open-Source GNSS SDR,<br> ver. 0.20**
 
