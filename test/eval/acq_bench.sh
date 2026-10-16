@@ -8,7 +8,8 @@
 #  usage: acq_bench.sh IF_file backend ...  (e.g. cpu rknn hailo:hef=<dir>)
 #
 #  environment: BENCH (default: ../utest/bench_sdr_acq), BENCH_OPTS (e.g.
-#  "-wisdom fftw_wisdom.txt" for bench_sdr_acq_fftw), TASKSET (e.g. "taskset
+#  "-wisdom fftw_wisdom.txt" for bench_sdr_acq_fftw with the wisdom of
+#  wisdom_add.c), TASKSET (e.g. "taskset
 #  -c 4"), SIGS (signal options), OUT (output directory, default: ./out)
 #
 EVAL=$(cd "$(dirname "$0")" && pwd)
