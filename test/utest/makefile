@@ -12,6 +12,7 @@ LIB = ../../lib
 TEST_SRC = ../src
 
 TESTS = \
+    test_sdr_acc \
     test_sdr_array \
     test_sdr_ch \
     test_sdr_cmn \
@@ -31,7 +32,9 @@ TESTS = \
     test_sdr_web
 
 PERF_TESTS = \
-    test_sdr_perf
+    test_sdr_perf \
+    bench_sdr_acq \
+    bench_sdr_trk
 
 ifeq ($(OS),Windows_NT)
     CC = g++
@@ -114,6 +117,8 @@ STUB_DEV  = $(TEST_SRC)/sdr_dev_stub.c
 STUB_SDEV = $(TEST_SRC)/sdr_sdev_stub.c
 STUB_RCV  = $(TEST_SRC)/sdr_rcv_stub.c
 
+SRC_test_sdr_acc      = $(SRC)/sdr_acc.c $(SRC)/sdr_func.c $(SRC)/sdr_code.c \
+                        $(SRC)/sdr_code_gal.c $(SRC)/sdr_cmn.c
 SRC_test_sdr_array    = $(SRC)/sdr_array.c $(SRC)/sdr_cmn.c
 SRC_test_sdr_ch       = $(SRC)/sdr_ch.c $(SRC)/sdr_nav.c $(SRC)/sdr_code.c \
                         $(SRC)/sdr_code_gal.c $(SRC)/sdr_func.c $(SRC)/sdr_acc.c \
@@ -159,7 +164,12 @@ SRC_test_sdr_web      = $(SRC)/sdr_web.c $(SRC)/sdr_rcv.c $(SRC)/sdr_ch.c \
                         $(STUB_DEV) $(STUB_SDEV) $(STUB_USB) \
                         $(SRC)/sdr_cmn.c
 
+SRC_bench_sdr_acq     = $(SRC_test_sdr_perf)
+SRC_bench_sdr_trk     = $(SRC_test_sdr_perf)
+
 CFLAGS_test_sdr_perf  = -O3 $(filter-out -O2,$(CFLAGS))
+CFLAGS_bench_sdr_acq  = $(CFLAGS_test_sdr_perf)
+CFLAGS_bench_sdr_trk  = $(CFLAGS_test_sdr_perf)
 CFLAGS_test_sdr_ch    = $(CFLAGS) -DSDR_CH_TEST
 CFLAGS_test_sdr_nav   = $(CFLAGS) -DSDR_NAV_TEST
 
@@ -171,6 +181,13 @@ $(1)$(EXE): $(TEST_SRC)/$(1).c $$(SRC_$(1)) $(TEST_SRC)/test_sdr.h $(LIBDEP)
 endef
 
 $(foreach T,$(TESTS) $(PERF_TESTS),$(eval $(call BUILD_TEST,$(T))))
+
+# acquisition benchmark linked with FFTW (baseline of FFT library)
+FFTW_CFLAGS = $(filter-out -I$(LIB)/pocketfft,$(CFLAGS_bench_sdr_acq)) -DFFTW
+FFTW_LDLIBS = $(STATIC_OPT) $(LIB_DIR)/librtk.a -lfftw3f $(SYS_LIBS)
+
+bench_sdr_acq_fftw$(EXE): $(TEST_SRC)/bench_sdr_acq.c $(SRC_bench_sdr_acq) $(LIB_DIR)/librtk.a
+	$(CC) $(FFTW_CFLAGS) $(LDFLAGS) -o $@ $(TEST_SRC)/bench_sdr_acq.c $(SRC_bench_sdr_acq) $(FFTW_LDLIBS)
 
 ifneq ($(EXE),)
 $(TESTS) $(PERF_TESTS): %: %$(EXE)
