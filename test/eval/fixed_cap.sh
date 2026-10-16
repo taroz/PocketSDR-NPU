@@ -10,8 +10,9 @@
 #         (e.g. fixed_cap.sh "140 157 175 200" 2 hailo:hef=<dir>,batch=16 cpu)
 #
 #  environment: INPUT (300 s IF data), TRK, OUT, CAP_OPTS (other options, e.g.
-#  "-opt fftw.conf" with FFTW wisdom) (see e2e.sh), the results summarized by
-#  cap_sum.py OUT/fx_*
+#  "-opt fftw.conf" with FFTW wisdom), CAP_OPTS_A, CAP_OPTS_B (options of
+#  backend_a or b only, e.g. "-cpu_acq 0-3 -cpu_trk 4-7") (see e2e.sh), the
+#  results summarized by cap_sum.py OUT/fx_*
 #
 #  -rcv_prio needs CAP_SYS_NICE (e.g. sudo setcap cap_sys_nice+ep pocket_trk).
 #
@@ -21,12 +22,12 @@ DEC="1:3:7.42,1:3:-6.902,2:3 -LOG_LEVEL=4" # (log level 4: buffer usage)
 tag() { echo "$1" | cut -d: -f1; }
 run() {
     SIGFILE=$EVAL/fix_$2.sh $EVAL/e2e.sh fx_$2_$(tag $3)_$1 -acc $3 -rcv_prio 10 \
-        -trk_guard 20 -dec "$DEC" $CAP_OPTS
+        -trk_guard 20 -dec "$DEC" $CAP_OPTS $4
     sleep 30
 }
 for r in $(seq 1 ${2:-1}); do
     for N in $1; do
-        if [ $((r % 2)) = 1 ]; then run $r $N "$3"; run $r $N "$4"
-        else run $r $N "$4"; run $r $N "$3"; fi
+        if [ $((r % 2)) = 1 ]; then run $r $N "$3" "$CAP_OPTS_A"; run $r $N "$4" "$CAP_OPTS_B"
+        else run $r $N "$4" "$CAP_OPTS_B"; run $r $N "$3" "$CAP_OPTS_A"; fi
     done
 done
