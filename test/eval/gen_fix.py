@@ -5,8 +5,9 @@
 # duplicating the signals in the same order, + background search channels
 # (signals never found, the same as gen_cap.py)
 # usage: gen_fix.py reliable.txt found_all.txt N out.sh
-# (fix_140/157/175/200.sh generated from reliable24.txt: the signals tracked
-# to the end of the 24 MHz reference runs)
+# (fix_<N>.sh: gen_fix.py reliable24.txt found24.txt N fix_<N>.sh, reliable24:
+# the signals tracked to the end of the 24 MHz reference runs, found24: the
+# signals of the background list ever found)
 import sys, random
 RFCH = {'L1CA':1,'L1CD':1,'L1CP':1,'E1B':1,'E1C':1,'B1CD':1,'B1CP':1,'B1I':1,
     'L1S':1,'I1SD':1,'I1SP':1,'L2CM':2,'L5I':3,'L5Q':3,'E5AI':3,'E5AQ':3,
