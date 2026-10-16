@@ -308,6 +308,8 @@ pocket_trk [-sig sig -prn prn[,...] [-rfch ch[,...]] ...]
            [-driver name] [-gain gain] [-bw bw] [-fd dopp]
            [-log path] [-nmea path] [-rtcm path] [-raw path] ...
            [-arch nch] [-geom file]
+           [-cpu_acq cpus] [-cpu_trk cpus] [-rcv_prio prio] [-trk_guard pct]
+           [-dec rfch:D[:foff][,...]]
            [-h height] [-opt file] [-debug file] [-v] [file]
 ```
 
@@ -369,6 +371,25 @@ The input can be a local file, a TCP stream, a Pocket SDR FE device, or a SoapyS
 - `-geom file`
   - Array element positions file (body-frame, `pocket_sdr.py` array
     geometry format) applied at startup. [none]
+- `-cpu_acq cpus`
+  - CPU cores (e.g. `0-3`, `0,2-3`) for the channel threads in search state
+    (Linux and Windows, up to 64 CPUs). [all CPUs]
+- `-cpu_trk cpus`
+  - CPU cores for the channel threads in tracking state and the IF data input
+    thread. [all CPUs]
+- `-rcv_prio prio`
+  - Real-time priority (SCHED_RR, 1-99) of the IF data input thread (Linux,
+    needs root or CAP_SYS_NICE). [not changed]
+- `-trk_guard pct`
+  - No new signal search while the IF data buffer usage of the tracking
+    channels exceeds `pct` (%). [0: off]
+- `-dec rfch:D[:foff][,...]`
+  - Decimated sub-band of the RF CH (IQ sampling) by D (2, 3 or 4) by a
+    polyphase FIR (12 x D + 1 taps), lowpass or bandpass centered at `foff`
+    (MHz). The signals of the RF CH in the passband are searched and tracked
+    at fs/D. E.g. `-dec 1:3:7.42,1:3:-6.902,2:3` for
+    `pocket_L1L2L5E5b_24MHz.conf` (L1/E1 and B1I of RF CH 1 at 1568 MHz, L2C
+    of RF CH 2). [none]
 - `-h height`
   - Console height (rows) for the runtime status display. [`64`]
 - `-opt file`

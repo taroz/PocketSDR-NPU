@@ -28,6 +28,8 @@
 //                   -log and -raw options
 //  2026-08-02  1.12 add -arch and -geom options for antenna array
 //  2026-08-07  1.13 close the SDR device on console close for Windows
+//  2026-10-16  1.14 add -cpu_acq, -cpu_trk, -rcv_prio, -trk_guard and -dec
+//                   options
 //
 #include <math.h>
 #include <signal.h>
@@ -56,7 +58,8 @@ static const char *usage_text[] = {
     "       [-toff toff] [-ti tint] [-p bus,[,port] [-c conf_file]",
     "       [-driver name] [-gain gain] [-bw bw] [-fd dopp]",
     "       [-log path] [-nmea path] [-rtcm path] [-raw path] ... [-opt file]",
-    "       [-arch nch] [-geom file] [file]",
+    "       [-arch nch] [-geom file] [-cpu_acq cpus] [-cpu_trk cpus]",
+    "       [-rcv_prio prio] [-trk_guard pct] [-dec rfch:D[:foff][,...]] [file]",
     NULL
 };
 
@@ -214,6 +217,8 @@ int main(int argc, char **argv)
     double gain = 0.0, bw = 0.0, max_dop = 0.0;
     char rfch_opt[1024] = "-RFCH";
     const char *geom_file = "";
+    const char *cpu_acq = "", *cpu_trk = "", *dec = "";
+    int rcv_prio = 0, trk_guard = 0;
 
     for (int i = 1; i < argc; i++) {
         if (!strcmp(argv[i], "-sig") && i + 1 < argc) {
@@ -293,6 +298,16 @@ int main(int argc, char **argv)
                 atoi(argv[++i]));
         } else if (!strcmp(argv[i], "-geom") && i + 1 < argc) {
             geom_file = argv[++i];
+        } else if (!strcmp(argv[i], "-cpu_acq") && i + 1 < argc) {
+            cpu_acq = argv[++i];
+        } else if (!strcmp(argv[i], "-cpu_trk") && i + 1 < argc) {
+            cpu_trk = argv[++i];
+        } else if (!strcmp(argv[i], "-rcv_prio") && i + 1 < argc) {
+            rcv_prio = atoi(argv[++i]);
+        } else if (!strcmp(argv[i], "-trk_guard") && i + 1 < argc) {
+            trk_guard = atoi(argv[++i]);
+        } else if (!strcmp(argv[i], "-dec") && i + 1 < argc) {
+            dec = argv[++i];
         } else if (!strcmp(argv[i], "-v")) {
             print_ver();
         } else if (argv[i][0] == '-') {
@@ -312,6 +327,19 @@ int main(int argc, char **argv)
         sdr_rcv_setopt("max_dop", max_dop);
     }
     sdr_func_init(fftw_wisdom);
+    if (*cpu_acq || *cpu_trk) { // (threads inherit the CPU affinity)
+        if (!sdr_thread_affinity(*cpu_trk ? cpu_trk : SDR_CPU_ALL)) {
+            fprintf(stderr, "CPU affinity error: %s\n", cpu_trk);
+            return -1;
+        }
+    }
+    size_t len = strlen(rfch_opt);
+    snprintf(rfch_opt + len, sizeof(rfch_opt) - len, "%s%s%s%s",
+        *cpu_acq ? " -CPU_ACQ=" : "", cpu_acq, *cpu_trk ? " -CPU_TRK=" : "",
+        cpu_trk);
+    len = strlen(rfch_opt);
+    snprintf(rfch_opt + len, sizeof(rfch_opt) - len, " -RCV_PRIO=%d "
+        "-TRK_GUARD=%d%s%s", rcv_prio, trk_guard, *dec ? " -DEC=" : "", dec);
     
     signal(SIGTERM, sig_func);
     signal(SIGINT, sig_func);

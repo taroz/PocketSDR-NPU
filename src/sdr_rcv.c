@@ -25,6 +25,9 @@
 //                   sdr_rcv_str_stat()
 //                   add API sdr_rcv_write_str()
 //  2026-08-08  1.13 report an output stream open error as stream status error
+//  2026-10-16  1.14 add CPU affinity options -CPU_ACQ, -CPU_TRK
+//                   add options -RCV_PRIO, -TRK_GUARD
+//                   add option -DEC (decimated sub-bands of RF CHs)
 //
 #include "pocket_sdr.h"
 
@@ -84,6 +87,16 @@ static int64_t get_buff_ix(sdr_rcv_t *rcv)
 {
     sdr_mutex_lock(&rcv->mtx);
     int64_t ix = rcv->ix;
+    sdr_mutex_unlock(&rcv->mtx);
+    return ix;
+}
+
+// get IF data buffer pointer of sub-band (-1: RF CH) (decimated: last cycle) -
+static int64_t get_buff_ix_ch(sdr_rcv_t *rcv, int sub)
+{
+    sdr_mutex_lock(&rcv->mtx);
+    int64_t ix = rcv->ix;
+    if (sub >= 0 && rcv->dec_ix[sub] < ix) ix = rcv->dec_ix[sub];
     sdr_mutex_unlock(&rcv->mtx);
     return ix;
 }
@@ -511,6 +524,7 @@ static sdr_ch_th_t *ch_th_new(const char *sig, int prn, double fi, double fs,
         return NULL;
     }
     th->rcv = rcv;
+    th->sub = -1;
     return th;
 }
 
@@ -522,28 +536,66 @@ static void ch_th_free(sdr_ch_th_t *th)
     sdr_free(th);
 }
 
+// update navigation and observation data of SDR receiver CH ------------------
+static void ch_th_udpvt(sdr_ch_th_t *th)
+{
+    sdr_ch_t *ch = th->ch;
+    
+    // update navigation data
+    if (ch->nav->stat) {
+        sdr_pvt_udnav(th->rcv->pvt, ch);
+        ch->nav->stat = 0;
+    }
+    // update observation data
+    sdr_pvt_udobs(th->rcv->pvt, th->ix, ch);
+}
+
+// IF data buffer and samples per cycle of SDR receiver CH ---------------------
+static const sdr_buff_t *ch_buff(const sdr_ch_th_t *th)
+{
+    return th->sub >= 0 ? th->rcv->buffd[th->sub] : th->rcv->buff[th->ch->rf_ch];
+}
+static int ch_ncyc(const sdr_ch_th_t *th)
+{
+    return th->sub >= 0 ? th->rcv->N / th->rcv->sub_D[th->sub] : th->rcv->N;
+}
+
+// update SDR receiver CH for an epoch -----------------------------------------
+static void ch_th_update(sdr_ch_th_t *th)
+{
+    sdr_ch_t *ch = th->ch;
+    int nc = ch_ncyc(th);
+    
+    sdr_ch_update(ch, th->ix * SDR_CYC, ch_buff(th),
+        nc * (int)(th->ix % MAX_BUFF));
+    ch_th_udpvt(th);
+    th->ix += ch->N / nc;
+}
+
+// set CPU affinity of SDR receiver CH thread by CH state ---------------------
+//   (search: CPUs of acquisition, lock: CPUs of tracking)
+static void ch_th_cpu(sdr_ch_th_t *th)
+{
+    int cpu = th->ch->state == SDR_STATE_LOCK ? 2 : 1;
+    const char *cpus = cpu == 1 ? th->rcv->cpu_acq : th->rcv->cpu_trk;
+    
+    if (th->cpu == cpu || (!*th->rcv->cpu_acq && !*th->rcv->cpu_trk)) return;
+    sdr_thread_affinity(*cpus ? cpus : SDR_CPU_ALL);
+    th->cpu = cpu;
+}
+
 // SDR receiver CH thread ------------------------------------------------------
 static void *ch_thread(void *arg)
 {
     sdr_ch_th_t *th = (sdr_ch_th_t *)arg;
     sdr_ch_t *ch = th->ch;
-    int n = ch->N / th->rcv->N;
+    int n = ch->N / ch_ncyc(th);
     
     while (th->state) {
-        int64_t ix = get_buff_ix(th->rcv);
-        for ( ; th->ix + 2 * n <= ix && th->state; th->ix += n) {
-            
-            // update SDR receiver CH
-            sdr_ch_update(ch, th->ix * SDR_CYC, th->rcv->buff[ch->rf_ch],
-                th->rcv->N * (int)(th->ix % MAX_BUFF));
-            
-            // update navigation data
-            if (ch->nav->stat) {
-                sdr_pvt_udnav(th->rcv->pvt, ch);
-                ch->nav->stat = 0;
-            }
-            // update observation data
-            sdr_pvt_udobs(th->rcv->pvt, th->ix, ch);
+        int64_t ix = get_buff_ix_ch(th->rcv, th->sub);
+        while (th->ix + 2 * n <= ix && th->state) {
+            ch_th_cpu(th);
+            ch_th_update(th);
         }
         sdr_sleep_msec(TH_CYC);
     }
@@ -664,6 +716,17 @@ static void set_srch_ch(sdr_rcv_t *rcv, const char *opt)
 //      bits      (I)  number of bits for each RFCH
 //      opt       (I)  receiver options
 //                     -ARCH=<nch>: number of array channels
+//                     -CPU_ACQ=<cpus>: CPUs of acquisition (e.g. 0-3)
+//                     -CPU_TRK=<cpus>: CPUs of tracking (e.g. 4-7)
+//                     -RCV_PRIO=<prio>: real-time priority (SCHED_RR) of IF
+//                         input thread (1-99, 0: not changed)
+//                     -TRK_GUARD=<pct>: no new signal search while the IF
+//                         buffer usage of the tracking CHs > pct (0: off)
+//                     -DEC=<rfch>:<D>[:<foff>][,...]: decimated sub-band of RF
+//                         CH by D (2,3,4) with FIR lowpass (foff: 0) or
+//                         bandpass centered at foff (MHz) for the CHs of the RF
+//                         CH in the passband (search and tracking at fs/D,
+//                         IF frequency f mod fs/D, narrowband signals)
 //
 //  returns:
 //      SDR receiver (NULL: error)
@@ -687,6 +750,10 @@ sdr_rcv_t *sdr_rcv_new(const char **sigs, const int *prns, int n, int fmt,
         sscanf(p, "-BUMP_K=%lf", &sdr_bump_k);
     }
     rcv->fast_acq = strstr(opt, "-FAST_SRCH") ? 1 : 0;
+    if ((p = strstr(opt, "-CPU_ACQ="))) sscanf(p, "-CPU_ACQ=%63s", rcv->cpu_acq);
+    if ((p = strstr(opt, "-CPU_TRK="))) sscanf(p, "-CPU_TRK=%63s", rcv->cpu_trk);
+    if ((p = strstr(opt, "-RCV_PRIO="))) sscanf(p, "-RCV_PRIO=%d", &rcv->rcv_prio);
+    if ((p = strstr(opt, "-TRK_GUARD="))) sscanf(p, "-TRK_GUARD=%d", &rcv->trk_guard);
     rcv->fmt = fmt;
     rcv->fs = fs;
     rcv->nrfch = num_rfch(fmt);
@@ -700,6 +767,22 @@ sdr_rcv_t *sdr_rcv_new(const char **sigs, const int *prns, int n, int fmt,
             fmt == SDR_FMT_CS8) ? 8 : (fmt == SDR_FMT_CS16 ? 16 : bits[i]);
     }
     rcv->N = (int)(SDR_CYC * fs);
+    if ((p = strstr(opt, "-DEC="))) { // decimated sub-bands of RF CHs
+        for (p += 5; rcv->nsub < SDR_MAX_SUB; p++) {
+            int ch, d, k = 0;
+            double foff = 0.0;
+            if (sscanf(p, "%d:%d%n", &ch, &d, &k) < 2) break;
+            p += k;
+            if (*p == ':' && sscanf(p + 1, "%lf%n", &foff, &k) >= 1) p += 1 + k;
+            if (ch >= 1 && ch <= rcv->nrfch && d >= 2 && d <= 4 &&
+                rcv->N % d == 0 && rcv->rfch[ch-1].IQ == 2) {
+                rcv->sub_rf[rcv->nsub] = ch - 1;
+                rcv->sub_D[rcv->nsub] = d;
+                rcv->sub_foff[rcv->nsub++] = foff * 1e6;
+            }
+            if (*p != ',') break;
+        }
+    }
     
     for (int i = 0; i < n && rcv->nch < SDR_MAX_NCH; i++) {
         int ch[SDR_MAX_RFCH] = {0};
@@ -710,7 +793,21 @@ sdr_rcv_t *sdr_rcv_new(const char **sigs, const int *prns, int n, int fmt,
             if (rtoc_of(rcv, ch[j])) fi[j] -= fs * 0.25; // fs/4 shift
         }
         for (int j = 0; j < nch && rcv->nch < SDR_MAX_NCH; j++) {
-            sdr_ch_th_t *th = ch_th_new(sigs[i], prns[i], fi[j], fs, rcv);
+            // decimated sub-band with the IF frequency in the passband
+            int sub = -1;
+            for (int k = 0; k < rcv->nsub; k++) {
+                if (rcv->sub_rf[k] != ch[j] || fabs(fi[j] - rcv->sub_foff[k]) >
+                    0.45 * fs / rcv->sub_D[k]) continue;
+                if (sub < 0 || fabs(fi[j] - rcv->sub_foff[k]) <
+                    fabs(fi[j] - rcv->sub_foff[sub])) sub = k;
+            }
+            double fs_ch = fs, fi_ch = fi[j];
+            if (sub >= 0) { // IF frequency f mod fs/D in [-fs/2D, fs/2D)
+                fs_ch = fs / rcv->sub_D[sub];
+                fi_ch = fi[j] - floor(fi[j] / fs_ch + 0.5) * fs_ch;
+            }
+            sdr_ch_th_t *th = ch_th_new(sigs[i], prns[i], fi_ch, fs_ch, rcv);
+            if (th) th->sub = sub;
             if (th) {
                 th->ch->no = rcv->nch + 1;
                 th->ch->rf_ch = ch[j];
@@ -727,6 +824,10 @@ sdr_rcv_t *sdr_rcv_new(const char **sigs, const int *prns, int n, int fmt,
     
     for (int i = 0; i < nrfch; i++) {
         rcv->buff[i] = sdr_buff_new(rcv->N * MAX_BUFF, 2); // IQ
+    }
+    for (int i = 0; i < rcv->nsub; i++) { // decimated buffers and decimators
+        rcv->buffd[i] = sdr_buff_new(rcv->N / rcv->sub_D[i] * MAX_BUFF, 2);
+        rcv->decf[i] = sdr_dec_new(rcv->sub_D[i], 0, 0.0, rcv->sub_foff[i], fs);
     }
     rcv->ich = -1;
     snprintf(rcv->opt, sizeof(rcv->opt), "%s", opt);
@@ -762,6 +863,10 @@ void sdr_rcv_free(sdr_rcv_t *rcv)
     }
     for (int i = 0; i < rcv->nrfch + rcv_narch(rcv); i++) {
         sdr_buff_free(rcv->buff[i]);
+    }
+    for (int i = 0; i < rcv->nsub; i++) {
+        sdr_buff_free(rcv->buffd[i]);
+        sdr_dec_free(rcv->decf[i]);
     }
     for (int i = 0; i < SDR_MAX_RFCH; i++) {
         sdr_lpf_free(rcv->rfch[i].lpf);
@@ -1246,18 +1351,38 @@ static void update_scale(sdr_rcv_t *rcv)
 // update IF data buffer usage rate --------------------------------------------
 static void update_buff_use(sdr_rcv_t *rcv)
 {
+    double use_trk = 0.0, use_srch = 0.0;
+    int i_trk = -1, i_srch = -1;
     rcv->stats.buff_use = 0.0;
     int64_t ix = get_buff_ix(rcv);
     for (int i = 0; i < rcv->nch; i++) {
         double use = (ix - rcv->th[i]->ix) * 100.0 / MAX_BUFF;
         if (use > rcv->stats.buff_use) rcv->stats.buff_use = use;
+        if (rcv->th[i]->ch->state == SDR_STATE_LOCK) {
+            if (use > use_trk) use_trk = use, i_trk = i;
+        } else if (rcv->th[i]->ch->state == SDR_STATE_SRCH) {
+            if (use > use_srch) use_srch = use, i_srch = i;
+        }
     }
+    rcv->stats.buff_trk = use_trk;
+    
+    // buffer usage of tracking and search channels (for debug)
+    sdr_log(4, "$LOG,%.3f,,0,BUFF %.1f TRK %.1f %s %d SRCH %.1f %s %d", ix * SDR_CYC,
+        rcv->stats.buff_use, use_trk, i_trk >= 0 ? rcv->th[i_trk]->ch->sig : "",
+        i_trk >= 0 ? rcv->th[i_trk]->ch->prn : 0, use_srch,
+        i_srch >= 0 ? rcv->th[i_srch]->ch->sig : "",
+        i_srch >= 0 ? rcv->th[i_srch]->ch->prn : 0);
 }
 
 // update signal search channel ------------------------------------------------
 static void update_srch_ch(sdr_rcv_t *rcv)
 {
     if (rcv->stats.buff_use > MAX_BUFF_USE) { // IF data buffer full ?
+        return;
+    }
+    // tracking channels delayed ? (no new search to keep tracking)
+    if (rcv->trk_guard > 0 && rcv->stats.buff_trk > rcv->trk_guard &&
+        (rcv->ich < 0 || rcv->th[rcv->ich]->ch->state != SDR_STATE_SRCH)) {
         return;
     }
     // signal search channel busy ?
@@ -1292,6 +1417,46 @@ static void update_srch_ch(sdr_rcv_t *rcv)
     }
 }
 
+// decimation thread of sub-band ----------------------------------------------
+//   (decimates the IF data cycles written by the IF input thread, up to the
+//   cycle before the last written one, in parallel with the input thread; the
+//   output is written earlier by the group delay of the FIR, so that the cycle
+//   dx is complete after the cycle dx + 1 is decimated)
+typedef struct {sdr_rcv_t *rcv; int k;} dec_arg_t;
+
+static void *dec_thread(void *arg)
+{
+    sdr_rcv_t *rcv = ((dec_arg_t *)arg)->rcv;
+    int k = ((dec_arg_t *)arg)->k, rf = rcv->sub_rf[k];
+    int nd = rcv->N / rcv->sub_D[k], nb = nd * MAX_BUFF;
+    int dly = sdr_dec_delay(rcv->decf[k]);
+    sdr_cpx8_t *out = (sdr_cpx8_t *)sdr_malloc(nd);
+    int64_t dx = -1;
+    
+    while (rcv->state) {
+        int64_t ix = get_buff_ix(rcv);
+        if (dx + 1 >= ix) {
+            sdr_sleep_msec(1);
+            continue;
+        }
+        for (dx++; dx < ix && rcv->state; dx++) {
+            sdr_dec_apply(rcv->decf[k], rcv->buff[rf]->data + rcv->N *
+                (int)(dx % MAX_BUFF), rcv->N, out);
+            int64_t q = (dx * nd - dly) % nb; // compensate group delay
+            if (q < 0) q += nb;
+            for (int i = 0; i < nd; i++) {
+                rcv->buffd[k]->data[(q + i) % nb] = out[i];
+            }
+            sdr_mutex_lock(&rcv->mtx);
+            rcv->dec_ix[k] = dx - 1;
+            sdr_mutex_unlock(&rcv->mtx);
+        }
+        dx--;
+    }
+    sdr_free(out);
+    return NULL;
+}
+
 // SDR receiver thread ---------------------------------------------------------
 static void *rcv_thread(void *arg)
 {
@@ -1300,6 +1465,17 @@ static void *rcv_thread(void *arg)
     uint32_t tick = sdr_get_tick(), tick_r = tick;
     uint8_t *raw = (uint8_t *)sdr_malloc(ns * rcv->N);
     
+    if (*rcv->cpu_trk) sdr_thread_affinity(rcv->cpu_trk);
+#ifndef WIN32
+    // set thread scheduling real-time (log only - async stderr breaks display)
+    if (rcv->rcv_prio > 0) {
+        struct sched_param param = {rcv->rcv_prio};
+        if (pthread_setschedparam(pthread_self(), SCHED_RR, &param)) {
+            sdr_log(2, "$LOG,%.3f,%s,%d,set IF input thread scheduling error",
+                0.0, "", 0);
+        }
+    }
+#endif
     if (rcv->dev == SDR_DEV_USB) {
         sdr_dev_start((sdr_dev_t *)rcv->dp);
     } else if (rcv->dev == SDR_DEV_SOAPY) {
@@ -1307,6 +1483,16 @@ static void *rcv_thread(void *arg)
     }
     rcv->stats.sum = 0.0;
     
+    // decimation threads (inherit the CPU affinity and the priority)
+    static dec_arg_t dec_args[SDR_MAX_SUB];
+    for (int k = 0; k < rcv->nsub; k++) {
+        rcv->dec_ix[k] = -2;
+        dec_args[k].rcv = rcv;
+        dec_args[k].k = k;
+        if (!sdr_thread_create(&rcv->dec_th[k], dec_thread, dec_args + k)) {
+            fprintf(stderr, "decimation thread error\n");
+        }
+    }
     for (int64_t ix = 0; rcv->state; ix++) {
         if (ix % LOG_CYC == 0) {
             update_buff_use(rcv);
@@ -1349,6 +1535,9 @@ static void *rcv_thread(void *arg)
         sdr_dev_stop((sdr_dev_t *)rcv->dp);
     } else if (rcv->dev == SDR_DEV_SOAPY) {
         sdr_sdev_stop((sdr_sdev_t *)rcv->dp);
+    }
+    for (int k = 0; k < rcv->nsub; k++) { // (rcv->state = 0)
+        sdr_thread_join(rcv->dec_th[k]);
     }
     sdr_free(raw);
     return NULL;

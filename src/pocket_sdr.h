@@ -26,6 +26,7 @@
 //  2026-07-24  1.18 support up to 8 output streams with selectable types
 //  2026-08-01  1.19 add Web UI server APIs (sdr_web.c)
 //  2026-08-02  1.20 add Web UI receiver configuration and lifecycle APIs
+//  2026-10-16  1.21 add API sdr_thread_affinity(), decimator APIs
 //
 #ifndef POCKET_SDR_H
 #define POCKET_SDR_H
@@ -58,6 +59,8 @@ extern "C" {
 #define SDR_SIZE_UBUFF (1<<20)  // size of USB buffer (bytes)
 #define SDR_MAX_NPRN   256      // max number of PRNs
 #define SDR_MAX_NCH    1500     // max number of receiver channels
+#define SDR_CPU_ALL    "0-63"   // CPU list of all CPUs (sdr_thread_affinity())
+#define SDR_MAX_SUB    16       // max number of decimated sub-bands
 #define SDR_MAX_NSYM   2000     // max number of symbols
 #define SDR_MAX_DATA   4096     // max length of navigation data
 #define SDR_N_CORRX    101      // number of additional correlators
@@ -127,6 +130,7 @@ typedef struct {int8_t  I, Q;} sdr_cpx16_t; // 16(8+8)   bits complex type
 typedef struct {int32_t I, Q;} sdr_cpx64_t; // 64(32+32) bits complex type
 typedef float sdr_cpx_t[2];      // single precision complex type
 typedef struct sdr_lpf_tag sdr_lpf_t; // LPF type
+typedef struct sdr_dec_tag sdr_dec_t; // decimator type
 typedef struct sdr_web_tag sdr_web_t; // Web UI server type
 
 #ifdef WIN32
@@ -274,6 +278,7 @@ typedef struct {                // SDR IF data statistics
     double std;                 // IF data std-dev
     double rate, sum;           // IF data rate (MB/s) and total size (MB)
     double buff_use;            // IF data buffer usage (%)
+    double buff_trk;            // IF data buffer usage of tracking CHs (%)
     double sum_sq[2];           // accumulators {sum, sum-of-squares}
     double sum_iq[2];           // CS16 accumulators {sum I, sum Q}
     double sumsq_iq[2];         // CS16 accumulators {sum-of-squares I, Q}
@@ -288,6 +293,8 @@ typedef struct {                // SDR receiver channel thread type
     int64_t ix;                 // IF data buffer read pointer (cyc)
     struct sdr_rcv_tag *rcv;    // pointer to SDR receiver
     sdr_thread_t thread;        // SDR receiver channel thread
+    int sub;                    // decimated sub-band (-1: none)
+    int cpu;                    // CPU affinity set (0:none,1:acq,2:trk)
 } sdr_ch_th_t;
 
 typedef struct {                // SDR PVT type
@@ -394,6 +401,18 @@ typedef struct sdr_rcv_tag {    // SDR receiver type
     double tscale;              // time scale to replay IF data file
     char opt[1024];             // receiver options
     int fast_acq;               // fast acquisition flag (0:off, 1:on)
+    char cpu_acq[64];           // CPUs of acquisition (option -CPU_ACQ)
+    char cpu_trk[64];           // CPUs of tracking (option -CPU_TRK)
+    int rcv_prio;               // real-time priority of IF input thread (0:off)
+    int trk_guard;              // no new search if tracking buffer usage (%) > trk_guard (0:off)
+    int nsub;                   // number of decimated sub-bands (option -DEC)
+    int sub_rf[SDR_MAX_SUB];    // RF CH of sub-band
+    int sub_D[SDR_MAX_SUB];     // decimation factor of sub-band
+    double sub_foff[SDR_MAX_SUB]; // center frequency of sub-band (Hz)
+    sdr_buff_t *buffd[SDR_MAX_SUB]; // decimated IF data buffers
+    sdr_dec_t *decf[SDR_MAX_SUB]; // decimators
+    int64_t dec_ix[SDR_MAX_SUB]; // last decimated IF data cycle (cyc)
+    sdr_thread_t dec_th[SDR_MAX_SUB]; // decimation threads
     sdr_thread_t thread;        // SDR receiver thread
     sdr_mutex_t mtx;            // lock flag
 } sdr_rcv_t;
@@ -410,6 +429,7 @@ const char *sdr_get_name(void);
 const char *sdr_get_ver(void);
 int sdr_thread_create(sdr_thread_t *thread, void *(func)(void *), void *arg);
 void sdr_thread_join(sdr_thread_t thread);
+int sdr_thread_affinity(const char *cpus);
 void sdr_mutex_init(sdr_mutex_t *mtx);
 void sdr_mutex_lock(sdr_mutex_t *mtx);
 void sdr_mutex_unlock(sdr_mutex_t *mtx);
@@ -519,6 +539,10 @@ int sdr_gen_fftw_wisdom(const char *file, int N);
 sdr_lpf_t *sdr_lpf_new(double fc, double fs);
 void sdr_lpf_free(sdr_lpf_t *lpf);
 void sdr_lpf_apply(sdr_lpf_t *lpf, sdr_cpx8_t *data, int N);
+sdr_dec_t *sdr_dec_new(int D, int ntap, double fc, double foff, double fs);
+int sdr_dec_delay(const sdr_dec_t *dec);
+void sdr_dec_free(sdr_dec_t *dec);
+void sdr_dec_apply(sdr_dec_t *dec, const sdr_cpx8_t *in, int N, sdr_cpx8_t *out);
 
 // sdr_code.c
 int8_t *sdr_gen_code(const char *sig, int prn, int *N);
