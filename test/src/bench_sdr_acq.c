@@ -4,6 +4,7 @@
 //  usage: bench_sdr_acq [-fmt RAW32|RAW16|INT8X2] [-f fs_MHz] [-fo f1,f2,...]
 //             [-toff s] [-n nrep] [-acc backend] [-wisdom file] [-o out_file]
 //             [-dec ch:D[:foff_MHz],...] (decimated sub-bands as pocket_trk -dec)
+//             [-nseg n -tseg s] (n segments of IF data at toff, toff + s, ...)
 //             -sig sig -prn prns -rfch ch [-sig ...] file
 //
 //  -wisdom file: FFTW wisdom file (FFTW build). If the file does not exist,
@@ -183,7 +184,8 @@ int main(int argc, char **argv)
 {
     sig_spec_t sigs[MAX_SIG];
     int nsig = 0, fmt = SDR_FMT_RAW32, nrep = 1;
-    double fs = 16e6, fo[SDR_MAX_RFCH] = {0}, toff = 1.0;
+    double fs = 16e6, fo[SDR_MAX_RFCH] = {0}, toff = 1.0, tseg = 0.0;
+    int nseg = 1;
     const char *file = "", *out = "", *acc = "cpu", *wisdom = "";
     int ndec = 0, dec_ch[8], dec_D[8];
     double dec_foff[8];
@@ -201,6 +203,10 @@ int main(int argc, char **argv)
             for (int j = 0; j < SDR_MAX_RFCH; j++) fo[j] *= 1e6;
         } else if (!strcmp(argv[i], "-toff") && i + 1 < argc) {
             toff = atof(argv[++i]);
+        } else if (!strcmp(argv[i], "-nseg") && i + 1 < argc) {
+            nseg = atoi(argv[++i]);
+        } else if (!strcmp(argv[i], "-tseg") && i + 1 < argc) {
+            tseg = atof(argv[++i]);
         } else if (!strcmp(argv[i], "-n") && i + 1 < argc) {
             nrep = atoi(argv[++i]);
         } else if (!strcmp(argv[i], "-acc") && i + 1 < argc) {
@@ -245,46 +251,53 @@ int main(int argc, char **argv)
     FILE *fp = *out ? fopen(out, "w") : NULL;
 
     for (int i = 0; i < nsig; i++) {
-        sdr_buff_t *buff = read_if(file, fmt, fs, sigs[i].rfch, toff, T_DATA);
-        if (!buff) return -1;
-        double fi = sdr_sig_freq(sigs[i].sig) - fo[sigs[i].rfch], fsd = fs;
-        for (int j = 0; j < ndec; j++) { // decimated sub-band including the signal
-            double fo_d = fs / dec_D[j];
-            if (dec_ch[j] != sigs[i].rfch || fabs(fi - dec_foff[j]) > fo_d / 2) continue;
-            sdr_dec_t *dec = sdr_dec_new(dec_D[j], 0, 0.0, dec_foff[j], fs);
-            sdr_buff_t *bd = dec ? sdr_buff_new(buff->N / dec_D[j], 2) : NULL;
-            if (!bd) return -1;
-            sdr_dec_apply(dec, buff->data, buff->N / dec_D[j] * dec_D[j], bd->data);
-            sdr_dec_free(dec);
-            sdr_buff_free(buff);
-            buff = bd;
-            fsd = fo_d;
-            fi -= floor(fi / fsd + 0.5) * fsd; // aliased to [-fsd/2, fsd/2)
-            break;
-        }
         double tw = 0.0, tc = 0.0;
         int nfound = 0;
         sdr_acc_stat(NULL, 1);
-
-        for (int j = 0; j < sigs[i].nprn; j++) {
-            acq_res_t res;
-            for (int k = 0; k < nrep; k++) {
-                search(sigs[i].sig, sigs[i].prns[j], buff, fsd, fi, &res);
-                tw += res.t_wall;
-                tc += res.t_cpu;
+        for (int g = 0; g < nseg; g++) { // segments of IF data
+            sdr_buff_t *buff = read_if(file, fmt, fs, sigs[i].rfch,
+                toff + g * tseg, T_DATA);
+            if (!buff) return -1;
+            double fi = sdr_sig_freq(sigs[i].sig) - fo[sigs[i].rfch], fsd = fs;
+            for (int j = 0; j < ndec; j++) { // decimated sub-band including the signal
+                double fo_d = fs / dec_D[j];
+                if (dec_ch[j] != sigs[i].rfch || fabs(fi - dec_foff[j]) > fo_d / 2) continue;
+                sdr_dec_t *dec = sdr_dec_new(dec_D[j], 0, 0.0, dec_foff[j], fs);
+                sdr_buff_t *bd = dec ? sdr_buff_new(buff->N / dec_D[j], 2) : NULL;
+                if (!bd) return -1;
+                sdr_dec_apply(dec, buff->data, buff->N / dec_D[j] * dec_D[j], bd->data);
+                sdr_dec_free(dec);
+                sdr_buff_free(buff);
+                buff = bd;
+                fsd = fo_d;
+                fi -= floor(fi / fsd + 0.5) * fsd; // aliased to [-fsd/2, fsd/2)
+                break;
             }
-            nfound += res.found;
-            char line[256];
-            snprintf(line, sizeof(line),
-                "%-6s %3d %d %5.1f %4d %6d %9.2f %.7f %.6e %016llx",
-                res.sig, res.prn, res.found, res.cn0, res.idx[0], res.idx[1],
-                res.fd, res.coff * 1e3, res.P_max, (unsigned long long)res.hash);
-            printf("%s %8.2f\n", line, res.t_wall * 1e3);
-            if (fp) fprintf(fp, "%s\n", line);
+            for (int j = 0; j < sigs[i].nprn; j++) {
+                acq_res_t res;
+                for (int k = 0; k < nrep; k++) {
+                    search(sigs[i].sig, sigs[i].prns[j], buff, fsd, fi, &res);
+                    tw += res.t_wall;
+                    tc += res.t_cpu;
+                }
+                nfound += res.found;
+                char line[256];
+                snprintf(line, sizeof(line),
+                    "%-6s %3d %d %5.1f %4d %6d %9.2f %.7f %.6e %016llx",
+                    res.sig, res.prn, res.found, res.cn0, res.idx[0], res.idx[1],
+                    res.fd, res.coff * 1e3, res.P_max, (unsigned long long)res.hash);
+                if (nseg > 1) { // segment index
+                    size_t len = strlen(line);
+                    snprintf(line + len, sizeof(line) - len, " %d", g);
+                }
+                printf("%s %8.2f\n", line, res.t_wall * 1e3);
+                if (fp) fprintf(fp, "%s\n", line);
+            }
+            sdr_buff_free(buff);
         }
-        int ns = sigs[i].nprn * nrep;
+        int ns = sigs[i].nprn * nrep * nseg;
         printf("# %s: found=%d/%d search=%.2f ms/sig cpu=%.2f ms/sig "
-            "cpu_util=%.1f%%\n", sigs[i].sig, nfound, sigs[i].nprn,
+            "cpu_util=%.1f%%\n", sigs[i].sig, nfound, sigs[i].nprn * nseg,
             tw / ns * 1e3, tc / ns * 1e3, tc / tw * 100.0);
         sdr_acc_stat_t st;
         sdr_acc_stat(&st, 1);
@@ -296,7 +309,6 @@ int main(int argc, char **argv)
                 st.t_in / nc * 1e3, st.t_exec / nc * 1e3, st.t_out / nc * 1e3,
                 st.bytes_in / nc / 1e3, st.bytes_out / nc / 1e3);
         }
-        sdr_buff_free(buff);
     }
     if (fp) fclose(fp);
     sdr_acc_exit();
