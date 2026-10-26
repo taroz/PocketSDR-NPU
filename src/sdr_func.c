@@ -1091,6 +1091,36 @@ float sdr_corr_max(const float *P, int N, int Nmax, int M, double T, int *ix)
         (float)(10.0 * log10((P_max - P_ave) / P_ave / T)) : 0.0f;
 }
 
+//------------------------------------------------------------------------------
+//  C/N0 and fine Doppler frequency by the peak of correlation powers reduced by
+//  accelerator backend (sdr_acc_search_code_peak()), same as sdr_corr_max()
+//  and sdr_fine_dop().
+//
+//  args:
+//      Pk       (I)  peak of correlation powers (Pk[0]: max, Pk[1]: mean,
+//                    Pk[2], Pk[3]: at the code offset of max in bins ix[0]-1,
+//                    ix[0]+1)
+//      ix       (I)  index of max (ix[0]: Doppler bin, ix[1]: code offset)
+//      fds      (I)  Doppler frequency bins (Hz)
+//      len_fds  (I)  number of Doppler frequency bins
+//      T        (I)  code cycle (s)
+//      fd       (O)  fine Doppler frequency (Hz)
+//
+//  return:
+//      C/N0 (dB-Hz)
+//
+float sdr_corr_peak(const float *Pk, const int *ix, const float *fds,
+    int len_fds, double T, double *fd)
+{
+    float P[3] = {Pk[2], Pk[0], Pk[3]};
+    int ix1[2] = {1, 0};
+    
+    *fd = (ix[0] == 0 || ix[0] == len_fds - 1) ? fds[ix[0]] :
+        sdr_fine_dop(P, 1, fds + ix[0] - 1, 3, ix1);
+    return (Pk[1] > 0.0f) ?
+        (float)(10.0 * log10((Pk[0] - Pk[1]) / Pk[1] / T)) : 0.0f;
+}
+
 // polynomial fitting ----------------------------------------------------------
 static int poly_fit(const double *x, const double *y, int nx, int np, double *p)
 {

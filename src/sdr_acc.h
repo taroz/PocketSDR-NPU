@@ -11,6 +11,7 @@
 //
 //  History:
 //  2026-10-16  1.0  new
+//  2026-10-23  1.1  API version 2 (search_code_peak(), optional)
 //
 #ifndef SDR_ACC_H
 #define SDR_ACC_H
@@ -19,7 +20,7 @@
 extern "C" {
 #endif
 
-#define SDR_ACC_API_VER 1       // plugin API version
+#define SDR_ACC_API_VER 2       // plugin API version (1: no search_code_peak())
 
 typedef struct {                // accelerator profile of a call
     double t_in;                // input tensor preparation time (s)
@@ -63,6 +64,17 @@ typedef struct {                // accelerator backend plugin
     int (*search_code_multi)(const int8_t **x, int NW, const float *code,
         int M, double fs, const double *fc, int K, int nout, float *P,
         int ldP, sdr_acc_prof_t *prof);
+
+    // parallel code search of NW windows as search_code_multi() reduced to the
+    // peak of the correlation powers P[K][nout] (P not output)
+    //   Pk   (O) Pk[0]: max of P, Pk[1]: mean of P, Pk[2], Pk[3]: P at the
+    //            code offset of the max in the bins ix[0]-1, ix[0]+1 (0: out
+    //            of the bins)
+    //   ix   (O) ix[0]: bin, ix[1]: code offset of the max
+    // (NULL: not supported, API version 2)
+    int (*search_code_peak)(const int8_t **x, int NW, const float *code, int M,
+        double fs, const double *fc, int K, int nout, float *Pk, int *ix,
+        sdr_acc_prof_t *prof);
 } sdr_acc_plugin_t;
 
 // plugin entry point (exported by backend shared library)

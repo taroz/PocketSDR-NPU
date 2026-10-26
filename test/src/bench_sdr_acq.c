@@ -121,21 +121,33 @@ static void search(const char *sig, int prn, const sdr_buff_t *buff, double fs,
         ncall++;
     }
     memset(P, 0, sizeof(float) * M * n);
-    if (!sdr_acc_search_multi() || !sdr_acc_search_code_multi(ch->acq->code_fft,
-        ch->T, buff, ixs, nw, M, ch->N, fs, ch->fi, ch->acq->fds, n, P)) {
-        for (int i = 0; i < nw; i++) { // per window (as search_sig())
-            sdr_search_code2(ch->acq->code_fft, ch->T, buff, ixs[i], M, ch->N,
-                fs, ch->fi, ch->acq->fds, n, P);
-        }
+    float Pk[4];
+    if (sdr_acc_search_code_peak(ch->acq->code_fft, ch->T, buff, ixs, nw, M,
+        ch->N, fs, ch->fi, ch->acq->fds, n, Pk, res->idx)) { // reduced to peak
+        res->t_wall = wall_time() - t0;
+        res->t_cpu = cpu_time() - c0;
+        res->cn0 = sdr_corr_peak(Pk, res->idx, ch->acq->fds, n, ch->T, &res->fd);
+        res->P_max = Pk[0];
+        res->coff = res->idx[1] / fs;
+        res->hash = 0; // P not output
     }
-    res->t_wall = wall_time() - t0;
-    res->t_cpu = cpu_time() - c0;
-    res->cn0 = sdr_corr_max(P, M, ch->N, n, ch->T, res->idx);
-    res->P_max = P[res->idx[0] * M + res->idx[1]];
-    res->fd = sdr_fine_dop(P, M, ch->acq->fds, n, res->idx);
-    res->coff = res->idx[1] / fs;
-    for (int i = 0; i < n; i++) { // hash of code phases used by search_sig()
-        res->hash ^= hash_float(P + i * M, ch->N) + i;
+    else {
+        if (!sdr_acc_search_multi() || !sdr_acc_search_code_multi(ch->acq->code_fft,
+            ch->T, buff, ixs, nw, M, ch->N, fs, ch->fi, ch->acq->fds, n, P)) {
+            for (int i = 0; i < nw; i++) { // per window (as search_sig())
+                sdr_search_code2(ch->acq->code_fft, ch->T, buff, ixs[i], M, ch->N,
+                    fs, ch->fi, ch->acq->fds, n, P);
+            }
+        }
+        res->t_wall = wall_time() - t0;
+        res->t_cpu = cpu_time() - c0;
+        res->cn0 = sdr_corr_max(P, M, ch->N, n, ch->T, res->idx);
+        res->P_max = P[res->idx[0] * M + res->idx[1]];
+        res->fd = sdr_fine_dop(P, M, ch->acq->fds, n, res->idx);
+        res->coff = res->idx[1] / fs;
+        for (int i = 0; i < n; i++) { // hash of code phases used by search_sig()
+            res->hash ^= hash_float(P + i * M, ch->N) + i;
+        }
     }
     sdr_free(P);
 
