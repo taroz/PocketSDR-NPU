@@ -582,21 +582,30 @@ static void search_sig(sdr_ch_t *ch, double time, const sdr_buff_t *buff,
     
     if (ch->acq->n_sum * ch->T >= t_acq) {
         int idx[2];
+        float cn0, Pk[4];
+        double fd_pk = 0.0;
         
-        // multi-window search (each window by sdr_search_code2() if failed)
-        if (ch->acq->ix_sum && !sdr_acc_search_code_multi(ch->acq->code_fft,
+        // multi-window search reduced to the peak by accelerator backend
+        if (ch->acq->ix_sum && sdr_acc_search_code_peak(ch->acq->code_fft,
             ch->T, buff, ch->acq->ix_sum, ch->acq->n_sum, 2 * ch->N, ch->N,
-            ch->fs, ch->fi, fds, n, ch->acq->P_sum)) {
-            for (int i = 0; i < ch->acq->n_sum; i++) {
-                sdr_search_code2(ch->acq->code_fft, ch->T, buff,
-                    ch->acq->ix_sum[i], 2 * ch->N, ch->N, ch->fs, ch->fi, fds,
-                    n, ch->acq->P_sum);
+            ch->fs, ch->fi, fds, n, Pk, idx)) {
+            cn0 = sdr_corr_peak(Pk, idx, fds, n, ch->T, &fd_pk);
+        } else {
+            // multi-window search (each window by sdr_search_code2() if failed)
+            if (ch->acq->ix_sum && !sdr_acc_search_code_multi(ch->acq->code_fft,
+                ch->T, buff, ch->acq->ix_sum, ch->acq->n_sum, 2 * ch->N, ch->N,
+                ch->fs, ch->fi, fds, n, ch->acq->P_sum)) {
+                for (int i = 0; i < ch->acq->n_sum; i++) {
+                    sdr_search_code2(ch->acq->code_fft, ch->T, buff,
+                        ch->acq->ix_sum[i], 2 * ch->N, ch->N, ch->fs, ch->fi,
+                        fds, n, ch->acq->P_sum);
+                }
             }
+            // search max correlation power
+            cn0 = sdr_corr_max(ch->acq->P_sum, 2 * ch->N, ch->N, n, ch->T,
+                idx);
+            fd_pk = sdr_fine_dop(ch->acq->P_sum, 2 * ch->N, fds, n, idx);
         }
-        
-        // search max correlation power
-        float cn0 = sdr_corr_max(ch->acq->P_sum, 2 * ch->N, ch->N, n, ch->T,
-            idx);
         
         double thres = sdr_thres_cn0_l;
         if (assisted) {
@@ -605,7 +614,7 @@ static void search_sig(sdr_ch_t *ch, double time, const sdr_buff_t *buff,
             thres = MAX(sdr_thres_cn0_ext, lost + 1.0);
         }
         if (cn0 >= thres) {
-            double fd = sdr_fine_dop(ch->acq->P_sum, 2 * ch->N, fds, n, idx);
+            double fd = fd_pk;
             double coff = idx[1] / ch->fs;
             start_track(ch, time, fd, coff, cn0);
             sdr_log(3, "$LOG,%.3f,%s,%d,SIGNAL FOUND (%.1f,%.1f,%.7f)", ch->time,

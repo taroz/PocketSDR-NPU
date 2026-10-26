@@ -14,6 +14,7 @@
 //  2026-10-03  1.1  add batched tracking correlator (API version 2)
 //  2026-10-03  1.2  add parallel code search of int8 IF samples (API version 3)
 //  2026-10-11  1.3  add parallel code search of multiple windows (API version 4)
+//  2026-10-27  1.4  add parallel code search reduced to the peak (API version 5)
 //
 #ifndef SDR_ACC_H
 #define SDR_ACC_H
@@ -22,7 +23,7 @@
 extern "C" {
 #endif
 
-#define SDR_ACC_API_VER 4       // plugin API version
+#define SDR_ACC_API_VER 5       // plugin API version
 #define SDR_ACC_API_MIN 3       // min plugin API version supported
 
 typedef struct {                // accelerator profile of a call
@@ -103,6 +104,17 @@ typedef struct {                // accelerator backend plugin
     int (*search_code_i8_multi)(const int8_t **x, int NW, const float *code,
         int M, double fs, const double *fc, int K, int nout, float *P,
         int ldP, sdr_acc_prof_t *prof);
+
+    // parallel code search of NW windows as search_code_multi() reduced to the
+    // peak of the correlation powers P[K][nout] (P not output)
+    //   Pk   (O) Pk[0]: max of P, Pk[1]: mean of P, Pk[2], Pk[3]: P at the
+    //            code offset of the max in the bins ix[0]-1, ix[0]+1 (0: out
+    //            of the bins)
+    //   ix   (O) ix[0]: bin, ix[1]: code offset of the max
+    // (NULL: not supported) (API version >= 5)
+    int (*search_code_peak)(const int8_t **x, int NW, const float *code, int M,
+        double fs, const double *fc, int K, int nout, float *Pk, int *ix,
+        sdr_acc_prof_t *prof);
 } sdr_acc_plugin_t;
 
 // plugin entry point (exported by backend shared library)

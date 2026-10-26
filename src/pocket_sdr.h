@@ -530,6 +530,8 @@ void sdr_search_code_cpu(const sdr_cpx_t *code_fft, double T,
     const sdr_buff_t *buff, int ix, int N, double fs, double fi,
     const float *fds, int len_fds, float *P);
 float sdr_corr_max(const float *P, int N, int Nmax, int M, double T, int *ix);
+float sdr_corr_peak(const float *Pk, const int *ix, const float *fds,
+    int len_fds, double T, double *fd);
 double sdr_fine_dop(const float *P, int N, const float *fds, int len_fds,
     const int *ix);
 double sdr_shift_freq(const char *sig, int fcn, double fi);
@@ -602,6 +604,10 @@ void sdr_acc_trk_exit(void);
 int sdr_acc_trk_type(const char **name);
 void sdr_acc_trk_stat(sdr_acc_stat_t *stat, int reset);
 void sdr_acc_corr_batch(sdr_corr_job_t *jobs, int njob);
+int sdr_acc_search_peak(void);
+int sdr_acc_search_code_peak(const sdr_cpx_t *code_fft, double T,
+    const sdr_buff_t *buff, const int *ix, int NW, int N, int Nmax, double fs,
+    double fi, const float *fds, int len_fds, float *Pk, int *idx);
 
 // sdr_code.c
 int8_t *sdr_gen_code(const char *sig, int prn, int *N);

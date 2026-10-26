@@ -30,6 +30,7 @@
 //  2026-10-11  1.3  add sdr_acc_search_multi(), sdr_acc_search_code_multi()
 //                   plugin: CPU optimized for unsupported shapes (counted
 //                   as fallbacks)
+//  2026-10-27  1.4  add sdr_acc_search_peak(), sdr_acc_search_code_peak()
 //
 #if !defined(WIN32) && !defined(_GNU_SOURCE)
 #define _GNU_SOURCE         // sched_getaffinity()
@@ -470,6 +471,60 @@ int sdr_acc_search_code_multi(const sdr_cpx_t *code_fft, double T,
     int stat = acc_plugin->search_code_i8_multi(xs, NW, (const float *)code_fft,
         N, fs, fc, len_fds, Nmax, P, N, &prof);
     update_stat(stat, acc_time() - t0, t1 - t0, &prof);
+    return stat;
+}
+
+//------------------------------------------------------------------------------
+//  Check whether the accelerator backend supports the parallel code search
+//  reduced to the correlation peak (sdr_acc_search_code_peak()).
+//
+//  return:
+//      Status (1: supported, 0: not supported)
+//
+int sdr_acc_search_peak(void)
+{
+    return acc_type == SDR_ACC_PLUGIN && acc_plugin->api_ver >= 5 &&
+        acc_plugin->search_code_peak;
+}
+
+//------------------------------------------------------------------------------
+//  Parallel code search of multiple windows by accelerator backend reduced to
+//  the peak of the correlation powers (sum of the windows) P[len_fds][Nmax].
+//  Other arguments are same as sdr_acc_search_code_multi().
+//
+//  args:
+//      Pk    (O)  Pk[0]: max of P, Pk[1]: mean of P, Pk[2], Pk[3]: P at the
+//                 code offset of the max in the Doppler bins idx[0]-1,
+//                 idx[0]+1 (0: out of the bins)
+//      idx   (O)  index of the max (idx[0]: Doppler bin, idx[1]: code offset)
+//
+//  return:
+//      Status (1: OK, 0: not supported by backend (Pk, idx not output))
+//
+int sdr_acc_search_code_peak(const sdr_cpx_t *code_fft, double T,
+    const sdr_buff_t *buff, const int *ix, int NW, int N, int Nmax, double fs,
+    double fi, const float *fds, int len_fds, float *Pk, int *idx)
+{
+    if (!sdr_acc_search_peak() || NW <= 0 || Nmax <= 0 || Nmax > N) {
+        return 0;
+    }
+    sdr_acc_prof_t prof = {0};
+    double t0 = acc_time(), t1;
+    double *fc = (double *)acc_buff(1, sizeof(double) * len_fds);
+    int8_t *x8 = (int8_t *)acc_buff(0, 2 * (size_t)N * NW);
+    const int8_t **xs = (const int8_t **)acc_buff(3, sizeof(int8_t *) * NW);
+    
+    for (int i = 0; i < len_fds; i++) {
+        fc[i] = fi + fds[i];
+    }
+    for (int i = 0; i < NW; i++) {
+        buff_to_i8(buff, ix[i], N, x8 + 2 * (size_t)N * i);
+        xs[i] = x8 + 2 * (size_t)N * i;
+    }
+    t1 = acc_time();
+    int stat = acc_plugin->search_code_peak(xs, NW, (const float *)code_fft,
+        N, fs, fc, len_fds, Nmax, Pk, idx, &prof);
+    if (stat) update_stat(stat, acc_time() - t0, t1 - t0, &prof);
     return stat;
 }
 
