@@ -37,27 +37,41 @@ SDR, its RF front-ends and its documents, see the
 
 Acquisition time per signal (ms, all PRNs, mean of 5 runs), 24 MHz IF data of
 Pocket SDR FE 4CH (`pocket_L1L2L5E5b_24MHz.conf`), the narrowband signals
-decimated to 8 MHz. CPU: the same search on the CPU with FFTW. RK3588: ROCK 5C
-with the search on the Cortex-A76 or the Cortex-A55.
+decimated to 8 MHz. CPU: the same search on the CPU with FFTW. The results of
+the NPUs are in bold.
 
-| Signal (fs) | Pi 5 CPU | Pi 5 + AX8850 | RK3588 A76 CPU | RK3588 A76 + NPU | RK3588 A55 CPU | RK3588 A55 + NPU |
+Raspberry Pi 5 (Cortex-A76 2.4 GHz x 4):
+
+| Method | L1CA (8 MHz) | B1I (8 MHz) | E1B (8 MHz) | L5I (24 MHz) | L1CP (8 MHz, direct) | L2CM (8 MHz, direct) |
 |---|---|---|---|---|---|---|
-| L1CA (8 MHz) | 51 | 15 | 52 | 45 | 263 | 65 |
-| B1I (8 MHz) | 51 | 15 | 52 | 45 | 259 | 65 |
-| E1B (8 MHz) | 275 | 72 | 306 | 165 | 1536 | 207 |
-| L5I (24 MHz) | 197 | 66 | 203 | 132 | 1003 | 181 |
-| L1CP (8 MHz, direct) | 1088 | 206 | 1123 | 513 | 5557 | 645 |
-| L2CM (8 MHz, direct) | 2936 | 581 | 2918 | 1231 | 13213 | 1584 |
+| CPU | 51 | 51 | 275 | 197 | 1088 | 2936 |
+| AX8850 (M5Stack LLM-8850) | **15** | **15** | **72** | **66** | **206** | **581** |
+| Hailo-8 (AI HAT+) | **23** | **23** | **88** | **72** | **411** | - (*1) |
+| Hailo-10H (AI HAT+ 2) (*2) | **64** | **62** | **134** | **113** | **646** | **1127** |
 
-- The detections are the same as the CPU. The sensitivity (C/N0 at the
+(\*1) No model (too large for the Hailo-8), searched by the CPU.
+(\*2) Mean of 2 runs.
+
+ROCK 5C (RK3588, Cortex-A76 2.4 GHz x 4 + Cortex-A55 1.8 GHz x 4, the search
+on the A76 or the A55):
+
+| Method | L1CA (8 MHz) | B1I (8 MHz) | E1B (8 MHz) | L5I (24 MHz) | L1CP (8 MHz, direct) | L2CM (8 MHz, direct) |
+|---|---|---|---|---|---|---|
+| CPU (A76) | 52 | 52 | 306 | 203 | 1123 | 2918 |
+| RK3588 NPU (A76) | **45** | **45** | **165** | **132** | **513** | **1231** |
+| CPU (A55) | 263 | 259 | 1536 | 1003 | 5557 | 13213 |
+| RK3588 NPU (A55) | **65** | **65** | **207** | **181** | **645** | **1584** |
+
+- The detections are the same as the CPU. The sensitivity of the AX8850 and
+  the RK3588 NPU (C/N0 at the
   probability of detection 0.5) differs from the CPU by 0.06 dB or less
   (0.14 dB or less for L1CP).
-- The CPU time of the acquisition is 1/5.6-1/26 of the CPU on the Pi 5 with
-  AX8850 and 1/3.7-1/13 on the RK3588.
+- The CPU time of the acquisition is 1/5.6-1/26 of the CPU on the Raspberry
+  Pi 5 with AX8850 and 1/3.7-1/13 on the RK3588.
 - In the receiver (300 s, fixed sets of 140-260 signals), the NPU locks
   1.1-1.5 times more signals by 30 s with the search on the Cortex-A76 and
-  1.9 times with the search on the Cortex-A55. On the Pi 5 with AX8850, the
-  real-time limit of the tracked signals increases from about 175 to about 230.
+  1.9 times with the search on the Cortex-A55. On the Raspberry Pi 5 with
+  AX8850, the real-time limit of the tracked signals increases from about 175 to about 230.
 
 ## **Supported NPUs**
 
