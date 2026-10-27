@@ -35,32 +35,34 @@ SDR, its RF front-ends and its documents, see the
 
 ## **Results**
 
-Acquisition time per signal (ms, all PRNs, mean of 5 runs), 24 MHz IF data of
+Acquisition time per signal (all PRNs, mean of 5 runs), 24 MHz IF data of
 Pocket SDR FE 4CH (`pocket_L1L2L5E5b_24MHz.conf`), the narrowband signals
 decimated to 8 MHz. CPU: the same search on the CPU with FFTW. The results of
 the NPUs are in bold.
 
-Raspberry Pi 5 (Cortex-A76 2.4 GHz x 4):
+Raspberry Pi 5 (Cortex-A76 2.4 GHz x 4), search time per signal (ms) and
+speed-up to the CPU (x):
 
 | Method | L1CA (8 MHz) | B1I (8 MHz) | E1B (8 MHz) | L5I (24 MHz) | L1CP (8 MHz, direct) | L2CM (8 MHz, direct) |
 |---|---|---|---|---|---|---|
 | CPU | 51 | 51 | 275 | 197 | 1088 | 2936 |
-| AX8850 (M5Stack LLM-8850) | **15** | **15** | **72** | **66** | **206** | **581** |
-| Hailo-8 (AI HAT+) | **23** | **23** | **88** | **72** | **411** | - (*1) |
-| Hailo-10H (AI HAT+ 2) (*2) | **64** | **62** | **134** | **113** | **646** | **1127** |
+| AX8850 (M5Stack LLM-8850) | **15** (3.4x) | **15** (3.4x) | **72** (3.8x) | **66** (3.0x) | **206** (5.3x) | **581** (5.1x) |
+| Hailo-8 (AI HAT+) | **23** (2.2x) | **23** (2.2x) | **88** (3.1x) | **72** (2.7x) | **411** (2.6x) | - (*1) |
+| Hailo-10H (AI HAT+ 2) (*2) | **64** (0.8x) | **62** (0.8x) | **134** (2.1x) | **113** (1.7x) | **646** (1.7x) | **1127** (2.6x) |
 
 (\*1) No model (too large for the Hailo-8), searched by the CPU.
 (\*2) Mean of 2 runs.
 
 ROCK 5C (RK3588, Cortex-A76 2.4 GHz x 4 + Cortex-A55 1.8 GHz x 4, the search
-on the A76 or the A55):
+on the A76 or the A55), search time per signal (ms) and speed-up to the CPU on
+the same cores (x):
 
 | Method | L1CA (8 MHz) | B1I (8 MHz) | E1B (8 MHz) | L5I (24 MHz) | L1CP (8 MHz, direct) | L2CM (8 MHz, direct) |
 |---|---|---|---|---|---|---|
 | CPU (A76) | 52 | 52 | 306 | 203 | 1123 | 2918 |
-| RK3588 NPU (A76) | **45** | **45** | **165** | **132** | **513** | **1231** |
-| CPU (A55) | 263 | 259 | 1536 | 1003 | 5557 | 13213 |
-| RK3588 NPU (A55) | **65** | **65** | **207** | **181** | **645** | **1584** |
+| RK3588 NPU (A76) | **45** (1.1x) | **45** (1.2x) | **165** (1.9x) | **132** (1.5x) | **513** (2.2x) | **1231** (2.4x) |
+| CPU (A55) | 263 | 259 | 1536 | 1002 | 5557 | 13213 |
+| RK3588 NPU (A55) | **65** (4.0x) | **65** (4.0x) | **207** (7.4x) | **181** (5.5x) | **645** (8.6x) | **1584** (8.3x) |
 
 - The detections are the same as the CPU. The sensitivity of the AX8850 and
   the RK3588 NPU (C/N0 at the
