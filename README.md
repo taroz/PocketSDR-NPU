@@ -48,10 +48,9 @@ speed-up to the CPU (x):
 | CPU | 51 | 51 | 275 | 197 | 1088 | 2936 |
 | AX8850 (M5Stack LLM-8850) | **15** (3.4x) | **15** (3.4x) | **72** (3.8x) | **66** (3.0x) | **206** (5.3x) | **581** (5.1x) |
 | Hailo-8 (AI HAT+) | **23** (2.2x) | **23** (2.2x) | **88** (3.1x) | **72** (2.7x) | **411** (2.6x) | - (*1) |
-| Hailo-10H (AI HAT+ 2) (*2) | **64** (0.8x) | **62** (0.8x) | **134** (2.1x) | **113** (1.7x) | **646** (1.7x) | **1127** (2.6x) |
+| Hailo-10H (AI HAT+ 2) | **63** (0.8x) | **62** (0.8x) | **133** (2.1x) | **116** (1.7x) | **504** (2.2x) | **1134** (2.6x) |
 
 (\*1) No model (too large for the Hailo-8), searched by the CPU.
-(\*2) Mean of 2 runs.
 
 ROCK 5C (RK3588, Cortex-A76 2.4 GHz x 4 + Cortex-A55 1.8 GHz x 4, the search
 on the A76 or the A55), search time per signal (ms) and speed-up to the CPU on

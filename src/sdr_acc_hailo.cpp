@@ -20,12 +20,15 @@
 //           hef=dir: directory of HEFs (default: $SDR_ACC_HAILO_HEF or
 //                  <plugin dir>/hailo)
 //           batch=n: batch size of the models (default: HailoRT default)
+//  environment: SDR_ACC_HAILO_NOMAP: buffers not mapped for DMA in advance
 //
 //  Author:
 //  T.SUZUKI
 //
 //  History:
 //  2026-10-16  1.0  new
+//  2026-10-29  1.1  page aligned buffers mapped for DMA (CPU time halved by
+//                   no copy of unaligned buffers by HailoRT)
 //
 #include <stdio.h>
 #include <stdlib.h>
@@ -54,6 +57,14 @@ using Bindings = ConfiguredInferModel::Bindings;
 #define PI         3.1415926535897932
 #define TIMEOUT_MS 10000    // inference timeout (ms)
 
+// buffer mapped for DMA (page aligned, reused across inferences) ------------
+struct dbuf_t {
+    uint8_t *p = NULL;                  // buffer (never freed while mapped)
+    size_t n = 0;                       // allocated size (bytes)
+    uint8_t *data() { return p; }
+    uint16_t *data16() { return (uint16_t *)p; }
+};
+
 // HEF model -------------------------------------------------------------------
 struct hmodel_t {
     std::shared_ptr<InferModel> im;
@@ -62,21 +73,39 @@ struct hmodel_t {
     std::string out_name;
     int M = 0, Kc = 0, R = 0, A = 0, B = 0, sh = 0; // sh: shared DFT model
     float qs[4], qz[4], os = 1.0f, oz = 0.0f; // quantization of inputs/output
-    std::vector<std::vector<uint8_t>> xr, xi;  // IF samples per window
+    std::vector<dbuf_t> xr, xi;                // IF samples per window
     std::vector<uint8_t> cr, ci;               // code DFT [k1][k2]
-    std::vector<std::vector<uint8_t>> crs, cis; // rolled code DFT (ring)
-    std::vector<std::vector<uint16_t>> out;    // output per frame
+    std::vector<dbuf_t> crs, cis;              // rolled code DFT (ring)
+    std::vector<dbuf_t> out;                   // output per frame
     std::vector<std::unique_ptr<std::atomic<uint32_t>[]>> done; // done flags
     int ndone = 0;                             // (never freed for late callbacks)
     uint32_t gen = 0;                          // generation of the call
 };
 static int batch_size = 0;              // batch size (0: HailoRT default)
+static int dma_map = 1;                 // map buffers for DMA (0: not mapped)
 
 static std::unique_ptr<VDevice> vdev;
 static std::map<std::string, std::unique_ptr<hmodel_t>> hmodels;
 static std::string hef_dir;
 static std::vector<std::array<int, 4>> hefs; // HEFs in hef_dir (M, Kc, R, sh)
 static std::mutex call_mtx;
+
+// resize buffer mapped for DMA (grown only, page aligned) ---------------------
+static void dbuf_resize(dbuf_t &b, size_t n, hailo_dma_buffer_direction_t dir)
+{
+    const size_t PAGE = 16384;
+    if (n <= b.n) return;
+    if (b.p) {
+        if (dma_map) vdev->dma_unmap(b.p, b.n, dir);
+        free(b.p);
+    }
+    b.n = (n + PAGE - 1) / PAGE * PAGE;
+    b.p = (uint8_t *)aligned_alloc(PAGE, b.n);
+    memset(b.p, 0, b.n);
+    if (dma_map && vdev->dma_map(b.p, b.n, dir) != HAILO_SUCCESS) {
+        fprintf(stderr, "sdr_acc_hailo: dma_map error\n");
+    }
+}
 
 // current time (s) ------------------------------------------------------------
 static double now(void)
@@ -346,11 +375,18 @@ static int search_multi(const int8_t **xs, int NW,
     const int RING = 32;
     int nslot = std::min(RING, nch);
     if ((int)m->xr.size() < NW) { m->xr.resize(NW); m->xi.resize(NW); }
-    for (int w = 0; w < NW; w++) { m->xr[w].resize(M); m->xi[w].resize(M); }
+    for (int w = 0; w < NW; w++) {
+        dbuf_resize(m->xr[w], M, HAILO_DMA_BUFFER_DIRECTION_H2D);
+        dbuf_resize(m->xi[w], M, HAILO_DMA_BUFFER_DIRECTION_H2D);
+    }
     if ((int)m->crs.size() < nslot) { m->crs.resize(nslot); m->cis.resize(nslot); }
-    for (int i = 0; i < nslot; i++) { m->crs[i].resize(M); m->cis[i].resize(M); }
+    for (int i = 0; i < nslot; i++) {
+        dbuf_resize(m->crs[i], M, HAILO_DMA_BUFFER_DIRECTION_H2D);
+        dbuf_resize(m->cis[i], M, HAILO_DMA_BUFFER_DIRECTION_H2D);
+    }
     if ((int)m->out.size() < F) m->out.resize(F);
-    for (int f = 0; f < F; f++) m->out[f].resize((size_t)B * Kc * m->R);
+    size_t nbo = (size_t)B * Kc * m->R * 2; // output bytes of a frame
+    for (int f = 0; f < F; f++) dbuf_resize(m->out[f], nbo, HAILO_DMA_BUFFER_DIRECTION_D2H);
     std::vector<float> tab(2 * M);
     carr_table(fc[0] / fs, M, B, tab.data());
     if (m->sh) get_plan(M);
@@ -384,7 +420,7 @@ static int search_multi(const int8_t **xs, int NW,
         int c = k / Kc, kk = k % Kc;
         float ozp = m->oz, *p = P + (size_t)k * ldP;
         for (int w = 0; w < NW; w++) {
-            const uint16_t *ok = m->out[c * NW + w].data() + kk * Rm;
+            const uint16_t *ok = m->out[c * NW + w].data16() + kk * Rm;
             float osc = (float)(64.0 / ((double)M * M) * sx[w] * sx[w] * cmax * cmax * m->os);
             for (int p1b = 0; p1b < Rm && B * p1b < nout; p1b += ATILE) {
                 int nt = std::min(Rm, p1b + ATILE) - p1b;
@@ -465,7 +501,7 @@ static int search_multi(const int8_t **xs, int NW,
             bd.input(m->in_name[1])->set_buffer(MemoryView(m->xi[w].data(), M));
             bd.input(m->in_name[2])->set_buffer(MemoryView(cr, M));
             bd.input(m->in_name[3])->set_buffer(MemoryView(ci, M));
-            bd.output(m->out_name)->set_buffer(MemoryView(m->out[f].data(), m->out[f].size() * 2));
+            bd.output(m->out_name)->set_buffer(MemoryView(m->out[f].data(), nbo));
             if (!acc_done(f)) {
                 fprintf(stderr, "sdr_acc_hailo: inference error\n");
                 return 0;
@@ -533,6 +569,7 @@ static int acc_init(const char *opt)
 {
     hef_dir.clear();
     batch_size = 0;
+    dma_map = getenv("SDR_ACC_HAILO_NOMAP") ? 0 : 1;
     std::string s = opt ? opt : "";
     for (size_t p = 0; p < s.size(); ) {
         size_t q = s.find(',', p);
