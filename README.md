@@ -15,6 +15,7 @@ The receiver itself (tracking, navigation data, PVT) is Pocket SDR. For Pocket
 SDR, its RF front-ends and its documents, see the
 [**original repository**](https://github.com/tomojitakasu/PocketSDR).
 
+![PocketSDR-PU](https://github.com/user-attachments/assets/41a2966c-8466-42da-b5d9-30a82f791a66)
 ---
 
 ## **How It Works**
