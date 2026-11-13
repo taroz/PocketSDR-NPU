@@ -85,7 +85,9 @@ the same cores (x):
 | Rockchip RK3588 NPU | `libsdr_acc_rknn.so` | RKNN runtime 2.3 | `lib/build/gen_rknn_acq.py` (RKNN-Toolkit2) |
 
 The models depend on the NPU, the runtime version and the sampling rate. The
-models for the 24 MHz configuration above are in the release assets.
+models for the 24 MHz configuration above are in the
+[releases](https://github.com/taroz/PocketSDR-NPU/releases). Unzip
+`pocketsdr-npu-models-<npu>.zip` in `lib/linux`.
 
 | Model directory | Models (`acq_M<M>_K<Kc>_R<R>`) |
 |---|---|
@@ -137,6 +139,10 @@ pocket_trk -acc hailo:hef=../lib/linux/hailo8,batch=16 -dec 1:3:7.42,1:3:-6.902,
   the receiver (`fixed_cap.sh`, `cap_sum.py`), acquisition sensitivity with
   synthetic IF data (`gen_sens.py`, `sens_test.sh`, `sens_sum.py`)
 - `test/utest`: `bench_sdr_acq`, `bench_sdr_trk`, `test_sdr_acc`
+
+IF data of the results (Pocket SDR FE 4CH, 24 MHz, 300 s, 14.4 GB):
+[www.taroz.net/ifdata](https://www.taroz.net/ifdata/)
+(`L1L2L5E5b_24MHz_20261009_0635_300s.bin` and `.tag`).
 
 ## **Changes from Pocket SDR**
 
