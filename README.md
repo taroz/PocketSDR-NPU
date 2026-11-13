@@ -38,15 +38,17 @@ SDR, its RF front-ends and its documents, see the
 
 Acquisition time per signal (all PRNs, mean of 5 runs), 24 MHz IF data of
 Pocket SDR FE 4CH (`pocket_L1L2L5E5b_24MHz.conf`), the narrowband signals
-decimated to 8 MHz. CPU: the same search on the CPU with FFTW. The results of
-the NPUs are in bold.
+decimated to 8 MHz. CPU (FFTW): the same search on the CPU with FFTW. The
+results of the NPUs are in bold.
+
+![Acquisition time on Raspberry Pi 5](https://github.com/user-attachments/assets/5aa2c583-f38c-4f43-9c3f-57a301412c82)
 
 Raspberry Pi 5 (Cortex-A76 2.4 GHz x 4), search time per signal (ms) and
 speed-up to the CPU (x):
 
-| Method | L1CA (8 MHz) | B1I (8 MHz) | E1B (8 MHz) | L5I (24 MHz) | L1CP (8 MHz, direct) | L2CM (8 MHz, direct) |
+| Method | L1CA (8 MHz) | B1I (8 MHz) | E1B (8 MHz) | L5I (24 MHz) | L1CP (8 MHz) | L2CM (8 MHz) |
 |---|---|---|---|---|---|---|
-| CPU | 51 | 51 | 275 | 197 | 1088 | 2936 |
+| CPU (FFTW) | 51 | 51 | 275 | 197 | 1088 | 2936 |
 | AX8850 (M5Stack LLM-8850) | **15** (3.4x) | **15** (3.4x) | **72** (3.8x) | **66** (3.0x) | **206** (5.3x) | **581** (5.1x) |
 | Hailo-8 (AI HAT+) | **23** (2.2x) | **23** (2.2x) | **88** (3.1x) | **72** (2.7x) | **411** (2.6x) | - (*1) |
 | Hailo-10H (AI HAT+ 2) | **63** (0.8x) | **62** (0.8x) | **133** (2.1x) | **116** (1.7x) | **504** (2.2x) | **1134** (2.6x) |
@@ -57,11 +59,11 @@ ROCK 5C (RK3588, Cortex-A76 2.4 GHz x 4 + Cortex-A55 1.8 GHz x 4, the search
 on the A76 or the A55), search time per signal (ms) and speed-up to the CPU on
 the same cores (x):
 
-| Method | L1CA (8 MHz) | B1I (8 MHz) | E1B (8 MHz) | L5I (24 MHz) | L1CP (8 MHz, direct) | L2CM (8 MHz, direct) |
+| Method | L1CA (8 MHz) | B1I (8 MHz) | E1B (8 MHz) | L5I (24 MHz) | L1CP (8 MHz) | L2CM (8 MHz) |
 |---|---|---|---|---|---|---|
-| CPU (A76) | 52 | 52 | 306 | 203 | 1123 | 2918 |
+| CPU (FFTW, A76) | 52 | 52 | 306 | 203 | 1123 | 2918 |
 | RK3588 NPU (A76) | **45** (1.1x) | **45** (1.2x) | **165** (1.9x) | **132** (1.5x) | **513** (2.2x) | **1231** (2.4x) |
-| CPU (A55) | 263 | 259 | 1536 | 1002 | 5557 | 13213 |
+| CPU (FFTW, A55) | 263 | 259 | 1536 | 1002 | 5557 | 13213 |
 | RK3588 NPU (A55) | **65** (4.0x) | **65** (4.0x) | **207** (7.4x) | **181** (5.5x) | **645** (8.6x) | **1584** (8.3x) |
 
 - The detections are the same as the CPU. The sensitivity of the AX8850 and
@@ -140,9 +142,11 @@ pocket_trk -acc hailo:hef=../lib/linux/hailo8,batch=16 -dec 1:3:7.42,1:3:-6.902,
   synthetic IF data (`gen_sens.py`, `sens_test.sh`, `sens_sum.py`)
 - `test/utest`: `bench_sdr_acq`, `bench_sdr_trk`, `test_sdr_acc`
 
-IF data of the results (Pocket SDR FE 4CH, 24 MHz, 300 s, 14.4 GB):
-[www.taroz.net/ifdata](https://www.taroz.net/ifdata/)
-(`L1L2L5E5b_24MHz_20261009_0635_300s.bin` and `.tag`).
+IF data of the results (Pocket SDR FE 4CH, 24 MHz, 300 s):
+
+- [L1L2L5E5b_24MHz_20261009_0635_300s.bin](https://www.taroz.net/ifdata/L1L2L5E5b_24MHz_20261009_0635_300s.bin) (14.4 GB)
+- [L1L2L5E5b_24MHz_20261009_0635_300s.bin.tag](https://www.taroz.net/ifdata/L1L2L5E5b_24MHz_20261009_0635_300s.bin.tag)
+- [L1L2L5E5b_24MHz_20261009_0635_300s.md5](https://www.taroz.net/ifdata/L1L2L5E5b_24MHz_20261009_0635_300s.md5) (MD5 checksums)
 
 ## **Changes from Pocket SDR**
 
@@ -158,6 +162,11 @@ IF data of the results (Pocket SDR FE 4CH, 24 MHz, 300 s, 14.4 GB):
 
 Branches: `main` (this version), `dev` (development history with the other
 evaluated methods).
+
+## **Paper**
+
+T. Suzuki, NPU-Accelerated GNSS Signal Acquisition, arXiv:XXXX.XXXXX, 2026.
+[arXiv](https://arxiv.org/abs/XXXX.XXXXX)
 
 ## **License**
 
