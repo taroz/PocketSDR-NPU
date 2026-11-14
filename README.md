@@ -1,38 +1,42 @@
-# **PocketSDR-NPU - GNSS Signal Acquisition on NPUs of Single-Board Computers**
+# **PocketSDR-NPU - NPU-Accelerated GNSS Signal Acquisition**
 
-**PocketSDR-NPU** runs the GNSS signal acquisition (parallel code search) of
-[**Pocket SDR**](https://github.com/tomojitakasu/PocketSDR) on the NPU of a
-low-power single-board computer (SBC), e.g. Raspberry Pi 5 with AX8850
-(M5Stack LLM-8850, PCIe) or an RK3588 board (built-in NPU). The NPU makes the
-acquisition faster than the CPU (FFTW), 3.0-5.3 times on the Raspberry Pi 5
-with AX8850 and up to 8.6 times on the Cortex-A55 of RK3588, and reduces its
-CPU time, so the receiver searches more signals and locks them faster. On the
-Raspberry Pi 5 with AX8850, the receiver tracks about 230 signals in real time
-instead of about 175 with the acquisition on the CPU. The long codes (L1CP
-10 ms, L2CM 20 ms) can be acquired directly over the full Doppler range.
+**PocketSDR-NPU** uses the NPU (Neural Processing Unit) of a small single-board computer (SBC), which is
+made for machine learning, as an accelerator for GNSS signal acquisition. It
+is [**Pocket SDR**](https://github.com/tomojitakasu/PocketSDR), an open-source
+software GNSS receiver, with the parallel code search offloaded to the NPU.
+
+On SBCs, the acquisition is a large CPU load: it delays the first lock, takes
+the CPU time from the tracking and makes the direct search of long codes
+impractical. With the NPU (AX8850 on Raspberry Pi 5, the built-in NPU of
+RK3588):
+
+- The acquisition is **3.0-3.8 times faster** than an optimized CPU FFT (FFTW)
+  for the short codes on the Raspberry Pi 5 with AX8850.
+- The long codes (L1CP 10 ms, L2CM 20 ms) can be acquired **directly over the
+  full Doppler range** in a practical time (5.1-5.3 times faster).
+- In the receiver, **1.5 times more signals are locked within 30 s**, and the
+  time until 90% of them are locked is reduced from 66 s to 26 s.
+- The CPU is left to the tracking: the receiver **tracks about 230 signals in
+  real time instead of about 175**.
 
 The receiver itself (tracking, navigation data, PVT) is Pocket SDR. For Pocket
 SDR, its RF front-ends and its documents, see the
 [**original repository**](https://github.com/tomojitakasu/PocketSDR).
 
-![PocketSDR-PU](https://github.com/user-attachments/assets/41a2966c-8466-42da-b5d9-30a82f791a66)
+![PocketSDR-NPU](https://github.com/user-attachments/assets/41a2966c-8466-42da-b5d9-30a82f791a66)
 ---
 
 ## **How It Works**
 
-- The parallel code search is a DFT-based circular correlation of the IF data
-  and the code for each Doppler bin. With the Doppler bins spaced by fs / M
-  (M: DFT size), all bins share one DFT of the IF data shifted by the bin.
-- The DFT is computed on the NPU as a four-step DFT (matrix products, twiddle
-  factors and transposes). One inference processes a chunk of Doppler bins.
-- The division of the work depends on the connection of the NPU. On the
-  RK3588 (shared memory), the whole search including the DFT of the IF data
-  runs on the NPU (INT8, the last IDFT and the power in FP16). On the AX8850
-  (PCIe), the host computes the DFT of the IF data once (FFTW), and the NPU
-  computes the correlation in 16-bit, integrates the windows and finds the
-  peak on the card, so only the peaks are copied back to the host.
-- The acquisition is a plugin (`libsdr_acc_<name>.so`) loaded at runtime by
-  `-acc <name>`. Signals without a model are searched by the CPU.
+- The DFT of the parallel code search is decomposed by the four-step DFT into
+  matrix products of small DFTs, which an NPU computes efficiently
+  (1x1 convolutions, element-wise products and transposes).
+- The work is divided between the CPU and the NPU by how the NPU is connected:
+  on the RK3588 (memory shared with the CPU), the whole search runs on the NPU;
+  on the AX8850 (PCIe, its own memory), the CPU computes the DFT of the IF data
+  once and the NPU does the rest including the peak search, so only the peaks
+  are copied back.
+- The acquisition is a plugin of Pocket SDR selected by `-acc <name>`.
 
 ## **Results**
 
@@ -66,16 +70,13 @@ the same cores (x):
 | CPU (FFTW, A55) | 263 | 259 | 1536 | 1002 | 5557 | 13213 |
 | RK3588 NPU (A55) | **65** (4.0x) | **65** (4.0x) | **207** (7.4x) | **181** (5.5x) | **645** (8.6x) | **1584** (8.3x) |
 
-- The detections are the same as the CPU. The sensitivity of the AX8850 and
-  the RK3588 NPU (C/N0 at the
-  probability of detection 0.5) differs from the CPU by 0.06 dB or less
-  (0.14 dB or less for L1CP).
+- The NPU detects the same signals as the CPU, with the sensitivity within
+  0.06 dB (0.14 dB for L1CP).
 - The CPU time of the acquisition is 1/5.6-1/26 of the CPU on the Raspberry
   Pi 5 with AX8850 and 1/3.7-1/13 on the RK3588.
-- In the receiver (300 s, fixed sets of 140-260 signals), the NPU locks
-  1.1-1.5 times more signals by 30 s with the search on the Cortex-A76 and
-  1.9 times with the search on the Cortex-A55. On the Raspberry Pi 5 with
-  AX8850, the real-time limit of the tracked signals increases from about 175 to about 230.
+- In the receiver (300 s, fixed sets of 140-260 signals), the real-time limit
+  of the tracked signals on the Raspberry Pi 5 with AX8850 increases from
+  about 175 to about 230.
 
 ## **Supported NPUs**
 
