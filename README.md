@@ -1,16 +1,11 @@
-# **PocketSDR-NPU - NPU-Accelerated GNSS Signal Acquisition**
+# **NPU-Accelerated GNSS Signal Acquisition**
 
 **PocketSDR-NPU** uses the NPU (Neural Processing Unit) of a small single-board computer (SBC), which is
 made for machine learning, as an accelerator for GNSS signal acquisition. It
-is [**Pocket SDR**](https://github.com/tomojitakasu/PocketSDR), an open-source
+is based on [**Pocket SDR**](https://github.com/tomojitakasu/PocketSDR), an open-source
 software GNSS receiver, with the parallel code search offloaded to the NPU.
 
-On SBCs, the acquisition is a large CPU load: it delays the first lock, takes
-the CPU time from the tracking and makes the direct search of long codes
-impractical. With the NPU (AX8850 on Raspberry Pi 5, the built-in NPU of
-RK3588):
-
-- The acquisition is **3.0-3.8 times faster** than an optimized CPU FFT (FFTW)
+- The GNSS signal acquisition is **3.0-3.8 times faster** than an optimized CPU FFT (FFTW)
   for the short codes on the Raspberry Pi 5 with AX8850.
 - The long codes (L1CP 10 ms, L2CM 20 ms) can be acquired **directly over the
   full Doppler range** in a practical time (5.1-5.3 times faster).
@@ -40,15 +35,13 @@ SDR, its RF front-ends and its documents, see the
 
 ## **Results**
 
-Acquisition time per signal (all PRNs, mean of 5 runs), 24 MHz IF data of
+Acquisition time per signal, 24 MHz IF data of
 Pocket SDR FE 4CH (`pocket_L1L2L5E5b_24MHz.conf`), the narrowband signals
-decimated to 8 MHz. CPU (FFTW): the same search on the CPU with FFTW. The
-results of the NPUs are in bold.
+decimated to 8 MHz. CPU (FFTW): the same search on the CPU with FFTW. 
 
 ![Acquisition time on Raspberry Pi 5](https://github.com/user-attachments/assets/5aa2c583-f38c-4f43-9c3f-57a301412c82)
 
-Raspberry Pi 5 (Cortex-A76 2.4 GHz x 4), search time per signal (ms) and
-speed-up to the CPU (x):
+Raspberry Pi 5 (Cortex-A76), search time per signal (ms) and speed-up to the CPU (x):
 
 | Method | L1CA (8 MHz) | B1I (8 MHz) | E1B (8 MHz) | L5I (24 MHz) | L1CP (8 MHz) | L2CM (8 MHz) |
 |---|---|---|---|---|---|---|
@@ -57,10 +50,9 @@ speed-up to the CPU (x):
 | Hailo-8 (AI HAT+) | **23** (2.2x) | **23** (2.2x) | **88** (3.1x) | **72** (2.7x) | **411** (2.6x) | - (*1) |
 | Hailo-10H (AI HAT+ 2) | **63** (0.8x) | **62** (0.8x) | **133** (2.1x) | **116** (1.7x) | **504** (2.2x) | **1134** (2.6x) |
 
-(\*1) No model (too large for the Hailo-8), searched by the CPU.
+(\*1) No model (too large for the Hailo-8).
 
-ROCK 5C (RK3588, Cortex-A76 2.4 GHz x 4 + Cortex-A55 1.8 GHz x 4, the search
-on the A76 or the A55), search time per signal (ms) and speed-up to the CPU on
+ROCK 5C (RK3588, Cortex-A76 + Cortex-A55), search time per signal (ms) and speed-up to the CPU on
 the same cores (x):
 
 | Method | L1CA (8 MHz) | B1I (8 MHz) | E1B (8 MHz) | L5I (24 MHz) | L1CP (8 MHz) | L2CM (8 MHz) |
@@ -70,12 +62,9 @@ the same cores (x):
 | CPU (FFTW, A55) | 263 | 259 | 1536 | 1002 | 5557 | 13213 |
 | RK3588 NPU (A55) | **65** (4.0x) | **65** (4.0x) | **207** (7.4x) | **181** (5.5x) | **645** (8.6x) | **1584** (8.3x) |
 
-- The NPU detects the same signals as the CPU, with the sensitivity within
-  0.06 dB (0.14 dB for L1CP).
-- The CPU time of the acquisition is 1/5.6-1/26 of the CPU on the Raspberry
-  Pi 5 with AX8850 and 1/3.7-1/13 on the RK3588.
-- In the receiver (300 s, fixed sets of 140-260 signals), the real-time limit
-  of the tracked signals on the Raspberry Pi 5 with AX8850 increases from
+- The NPU detects the same signals as the CPU, with the sensitivity within 0.06 dB.
+- The CPU time of the acquisition is 1/5.6-1/26 of the CPU on the Raspberry Pi 5 with AX8850 and 1/3.7-1/13 on the RK3588.
+- In the receiver (300 s, fixed sets of 140-260 signals), the real-time limit of the tracked signals on the Raspberry Pi 5 with AX8850 increases from
   about 175 to about 230.
 
 ## **Supported NPUs**
