@@ -41,7 +41,8 @@ decimated to 8 MHz. CPU (FFTW): the same search on the CPU with FFTW.
 
 ![Acquisition time on Raspberry Pi 5](https://github.com/user-attachments/assets/5aa2c583-f38c-4f43-9c3f-57a301412c82)
 
-Raspberry Pi 5 (Cortex-A76), search time per signal (ms) and speed-up to the CPU (x):
+### Raspberry Pi 5 + NPU
+- CPU: Cortex-A76, search time per signal (ms) and speed-up to the CPU (x):
 
 | Method | L1CA (8 MHz) | B1I (8 MHz) | E1B (8 MHz) | L5I (24 MHz) | L1CP (8 MHz) | L2CM (8 MHz) |
 |---|---|---|---|---|---|---|
@@ -52,7 +53,8 @@ Raspberry Pi 5 (Cortex-A76), search time per signal (ms) and speed-up to the CPU
 
 (\*1) No model (too large for the Hailo-8).
 
-ROCK 5C (RK3588, Cortex-A76 + Cortex-A55), search time per signal (ms) and speed-up to the CPU on
+### ROCK 5C (RK3588)
+- Cortex-A76 + Cortex-A55, search time per signal (ms) and speed-up to the CPU on
 the same cores (x):
 
 | Method | L1CA (8 MHz) | B1I (8 MHz) | E1B (8 MHz) | L5I (24 MHz) | L1CP (8 MHz) | L2CM (8 MHz) |
