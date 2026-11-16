@@ -153,6 +153,12 @@ evaluated methods).
 T. Suzuki, NPU-Accelerated GNSS Signal Acquisition, arXiv:2611.18186, 2026.
 [arXiv](https://arxiv.org/abs/2611.18186)
 
+## **Acknowledgments**
+
+The author is deeply grateful to Mr. Tomoji Takasu for developing
+[Pocket SDR](https://github.com/tomojitakasu/PocketSDR), on which this work is
+based, and for making it publicly available as open source.
+
 ## **License**
 
 BSD 2-clause license, the same as Pocket SDR (see [LICENSE.txt](LICENSE.txt)).
