@@ -5,12 +5,10 @@ made for machine learning, as an accelerator for GNSS signal acquisition. It
 is based on [**Pocket SDR**](https://github.com/tomojitakasu/PocketSDR), an open-source
 software GNSS receiver, with the parallel code search offloaded to the NPU.
 
-- The GNSS signal acquisition is **3.0-3.8 times faster** than an optimized CPU FFT (FFTW)
-  for the short codes on the Raspberry Pi 5 with AX8850.
+- The GNSS signal acquisition is **3.0-3.8 times faster** than an optimized CPU FFT.
 - The long codes (L1CP 10 ms, L2CM 20 ms) can be acquired **directly over the
   full Doppler range** in a practical time (5.1-5.3 times faster).
-- In the receiver, **1.5 times more signals are locked within 30 s**, and the
-  time until 90% of them are locked is reduced from 66 s to 26 s.
+- In the receiver, **1.5 times more signals are locked within 30 s**.
 - The CPU is left to the tracking: the receiver **tracks about 230 signals in
   real time instead of about 175**.
 
@@ -65,9 +63,7 @@ the same cores (x):
 | RK3588 NPU (A55) | **65** (4.0x) | **65** (4.0x) | **207** (7.4x) | **181** (5.5x) | **645** (8.6x) | **1584** (8.3x) |
 
 - The NPU detects the same signals as the CPU, with the sensitivity within 0.06 dB.
-- The CPU time of the acquisition is 1/5.6-1/26 of the CPU on the Raspberry Pi 5 with AX8850 and 1/3.7-1/13 on the RK3588.
-- In the receiver (300 s, fixed sets of 140-260 signals), the real-time limit of the tracked signals on the Raspberry Pi 5 with AX8850 increases from
-  about 175 to about 230.
+- In the receiver, the real-time limit of the tracked signals on the Raspberry Pi 5 with AX8850 increases from about 175 to about 230.
 
 ## **Supported NPUs**
 
@@ -146,9 +142,6 @@ IF data of the results (Pocket SDR FE 4CH, 24 MHz, 300 s):
   2 with the optional peak search `search_code_peak`) and the plugins for
   AX8850, RK3588 and Hailo (`src/sdr_acc_axcl.cpp`, `src/sdr_acc_rknn.cpp`,
   `src/sdr_acc_hailo.cpp`)
-- Shared DFT of the IF data among the Doppler bins in `sdr_search_code()`,
-  NEON carrier mixing of the tracking correlator, the fix of the 16 KB block
-  order of FE 4CH/8CH after a USB reset (proposed to Pocket SDR)
 - Receiver options for SBCs (`-dec`, `-trk_guard`, `-rcv_prio`, `-cpu_acq`,
   `-cpu_trk`)
 
