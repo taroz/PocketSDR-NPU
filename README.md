@@ -157,8 +157,8 @@ evaluated methods).
 
 ## **Paper**
 
-T. Suzuki, NPU-Accelerated GNSS Signal Acquisition, arXiv:XXXX.XXXXX, 2026.
-[arXiv](https://arxiv.org/abs/XXXX.XXXXX)
+T. Suzuki, NPU-Accelerated GNSS Signal Acquisition, arXiv:2611.18186, 2026.
+[arXiv](https://arxiv.org/abs/2611.18186)
 
 ## **License**
 
